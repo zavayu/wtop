@@ -10,4 +10,6 @@ license = "MIT OR Apache-2.0"
 crossterm = "0.29.0"
 ratatui = "0.30.2"
 sysinfo = "0.38.0"
+unicode-segmentation = "1.13.3"
+unicode-width = "0.2.2"
 windows = { version = "0.62.2", features = ["Win32_System_ProcessStatus"] }

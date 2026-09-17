@@ -1817,5 +1817,7 @@ dependencies = [
  "crossterm",
  "ratatui",
  "sysinfo",
+ "unicode-segmentation",
+ "unicode-width",
  "windows",
 ]

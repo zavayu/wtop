@@ -58,6 +58,22 @@ pub struct ProcessSnapshot {
     pub memory_bytes: u64,
 }
 
+impl ProcessSnapshot {
+    /// Returns the concise command-line representation shown in the process
+    /// table, including the executable fallback for inaccessible processes.
+    pub fn command_line_display(&self) -> String {
+        match &self.command_line {
+            CommandLine::Present(command_line) if command_line.is_empty() => "<empty>".into(),
+            CommandLine::Present(command_line) => command_line.clone(),
+            CommandLine::Unavailable => self.executable_path.as_ref().map_or_else(
+                || "<unavailable>".into(),
+                |path| format!("<unavailable> {}", path.display()),
+            ),
+            CommandLine::NotRequested => "<pending>".into(),
+        }
+    }
+}
+
 /// System-wide metrics displayed in the compact header.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SystemSnapshot {

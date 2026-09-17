@@ -4,7 +4,7 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use ratatui::{Terminal, backend::CrosstermBackend, prelude::Frame};
+use ratatui::{Terminal, backend::CrosstermBackend, layout::Rect, prelude::Frame};
 
 /// A full-screen terminal session that restores the user's terminal when it is
 /// dropped, including when `run` returns an error.
@@ -38,6 +38,12 @@ impl TerminalSession {
         F: FnOnce(&mut Frame),
     {
         self.terminal.draw(render).map(|_| ())
+    }
+
+    pub fn size(&self) -> io::Result<Rect> {
+        self.terminal
+            .size()
+            .map(|size| Rect::new(0, 0, size.width, size.height))
     }
 }
 
