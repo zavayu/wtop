@@ -24,6 +24,7 @@ pub struct App {
     command_line_offset_cells: u16,
     command_line_viewport_cells: u16,
     view_mode: ProcessViewMode,
+    cpu_display_mode: CpuDisplayMode,
     collapsed_pids: HashSet<u32>,
     sort: SortSpec,
     filter: String,
@@ -61,6 +62,14 @@ pub enum ProcessViewMode {
     #[default]
     Flat,
     Tree,
+}
+
+/// Chooses the aggregate CPU history or current logical-CPU meters in the header.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum CpuDisplayMode {
+    #[default]
+    Summary,
+    LogicalCpus,
 }
 
 /// One rendered process row, enriched with tree-only presentation state.
@@ -113,6 +122,17 @@ impl App {
 
     pub fn view_mode(&self) -> ProcessViewMode {
         self.view_mode
+    }
+
+    pub fn cpu_display_mode(&self) -> CpuDisplayMode {
+        self.cpu_display_mode
+    }
+
+    pub fn toggle_cpu_display_mode(&mut self) {
+        self.cpu_display_mode = match self.cpu_display_mode {
+            CpuDisplayMode::Summary => CpuDisplayMode::LogicalCpus,
+            CpuDisplayMode::LogicalCpus => CpuDisplayMode::Summary,
+        };
     }
 
     pub fn toggle_view_mode(&mut self) {
@@ -192,6 +212,7 @@ impl App {
             KeyCode::Char('s') => self.cycle_sort_column(),
             KeyCode::Char('S') => self.reverse_sort_direction(),
             KeyCode::Char('t') => self.toggle_view_mode(),
+            KeyCode::Char('c') => self.toggle_cpu_display_mode(),
             KeyCode::Char('/') => self.begin_filter_edit(),
             KeyCode::Up => self.move_selection_by(-1),
             KeyCode::Down => self.move_selection_by(1),
@@ -749,7 +770,7 @@ fn process_matches_filter(process: &ProcessSnapshot, lowercase_filter: &str) -> 
 mod tests {
     use std::{sync::Arc, time::Instant};
 
-    use super::{App, ProcessViewMode, SortColumn, SortDirection, SortSpec};
+    use super::{App, CpuDisplayMode, ProcessViewMode, SortColumn, SortDirection, SortSpec};
     use crate::model::{CommandLine, Metric, ProcessSnapshot, Snapshot, SystemSnapshot};
     use crossterm::event::{KeyCode, KeyModifiers};
 
@@ -782,12 +803,14 @@ mod tests {
             collected_at: Instant::now(),
             system: SystemSnapshot {
                 cpu_percent: Metric::fresh(0.0),
+                logical_cpu_percentages: Metric::fresh(Vec::new()),
                 total_memory_bytes: Metric::fresh(0),
                 used_memory_bytes: Metric::fresh(0),
                 commit_charge_bytes: Metric::fresh(0),
                 commit_limit_bytes: Metric::fresh(0),
             },
             processes: Metric::fresh(processes),
+            history: Default::default(),
         })
     }
 
@@ -798,6 +821,18 @@ mod tests {
             app.handle_key(key);
             assert!(app.should_quit());
         }
+    }
+
+    #[test]
+    fn c_toggles_between_summary_and_logical_cpu_header_modes() {
+        let mut app = App::new();
+        assert_eq!(app.cpu_display_mode(), CpuDisplayMode::Summary);
+
+        app.handle_key(KeyCode::Char('c'));
+        assert_eq!(app.cpu_display_mode(), CpuDisplayMode::LogicalCpus);
+
+        app.handle_key(KeyCode::Char('c'));
+        assert_eq!(app.cpu_display_mode(), CpuDisplayMode::Summary);
     }
 
     #[test]

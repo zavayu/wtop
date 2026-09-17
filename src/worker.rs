@@ -74,8 +74,12 @@ fn collect_until_shutdown(
     shutdown_receiver: Receiver<()>,
 ) {
     let mut collector = Collector::new();
-    let mut previous = None;
+    // CPU is a delta between refreshes. Collect once to establish sysinfo's
+    // timing baseline, but do not publish that unrepresentative first sample.
+    let baseline = Arc::new(collector.collect(None));
+    let mut previous = Some(baseline);
     let mut cadence = RefreshCadence::new(refresh_interval, Instant::now());
+    cadence.record_refresh_completed(Instant::now());
 
     loop {
         match shutdown_receiver.recv_timeout(cadence.wait_duration(Instant::now())) {
@@ -123,7 +127,7 @@ mod tests {
     };
 
     use super::{RefreshCadence, SnapshotStore};
-    use crate::model::{Metric, Snapshot, SystemSnapshot};
+    use crate::model::{History, Metric, Snapshot, SystemSnapshot};
 
     fn snapshot(generation: u64) -> Arc<Snapshot> {
         Arc::new(Snapshot {
@@ -131,12 +135,14 @@ mod tests {
             collected_at: Instant::now(),
             system: SystemSnapshot {
                 cpu_percent: Metric::fresh(0.0),
+                logical_cpu_percentages: Metric::fresh(Vec::new()),
                 total_memory_bytes: Metric::fresh(0),
                 used_memory_bytes: Metric::fresh(0),
                 commit_charge_bytes: Metric::fresh(0),
                 commit_limit_bytes: Metric::fresh(0),
             },
             processes: Metric::fresh(Vec::new()),
+            history: History::default(),
         })
     }
 
@@ -163,5 +169,15 @@ mod tests {
             cadence.wait_duration(collection_finished_at + Duration::from_millis(400)),
             Duration::from_millis(600)
         );
+    }
+
+    #[test]
+    fn cadence_delays_the_first_published_refresh_after_cpu_warmup() {
+        let started_at = Instant::now();
+        let mut cadence = RefreshCadence::new(Duration::from_secs(1), started_at);
+
+        cadence.record_refresh_completed(started_at);
+
+        assert_eq!(cadence.wait_duration(started_at), Duration::from_secs(1));
     }
 }

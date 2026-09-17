@@ -29,7 +29,7 @@ fn run() -> Result<(), Box<dyn Error>> {
 
     while !app.should_quit() {
         let terminal_area = terminal.size()?;
-        app.set_viewport_rows(ui::process_table_row_capacity(terminal_area));
+        app.set_viewport_rows(ui::process_table_row_capacity(terminal_area, &app));
         app.set_command_line_viewport_cells(ui::command_line_viewport_cells(terminal_area));
 
         if let Some(snapshot) = snapshot_store.latest()

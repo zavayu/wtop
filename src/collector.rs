@@ -7,7 +7,7 @@ use std::{
 use sysinfo::{Process, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 use windows::Win32::System::ProcessStatus::{GetPerformanceInfo, PERFORMANCE_INFORMATION};
 
-use crate::model::{CommandLine, Metric, ProcessSnapshot, Snapshot, SystemSnapshot};
+use crate::model::{CommandLine, HistorySample, Metric, ProcessSnapshot, Snapshot, SystemSnapshot};
 
 /// Collects the first-milestone process and system metrics.
 ///
@@ -73,23 +73,41 @@ impl Collector {
             ),
         };
 
+        let cpu_percent = self.system.global_cpu_usage();
+        let logical_cpu_percentages = self
+            .system
+            .cpus()
+            .iter()
+            .map(|cpu| normalize_system_cpu_percent(cpu.cpu_usage()))
+            .collect();
+        let total_memory_bytes = self.system.total_memory();
+        let used_memory_bytes = self.system.used_memory();
+
+        let mut history = previous
+            .map(|snapshot| snapshot.history.clone())
+            .unwrap_or_default();
+        history.push(HistorySample { cpu_percent });
+
         Snapshot {
             generation: self.generation,
             collected_at: Instant::now(),
             system: SystemSnapshot {
-                cpu_percent: Metric::fresh(self.system.global_cpu_usage()),
-                total_memory_bytes: Metric::fresh(self.system.total_memory()),
-                used_memory_bytes: Metric::fresh(self.system.used_memory()),
+                cpu_percent: Metric::fresh(cpu_percent),
+                logical_cpu_percentages: Metric::fresh(logical_cpu_percentages),
+                total_memory_bytes: Metric::fresh(total_memory_bytes),
+                used_memory_bytes: Metric::fresh(used_memory_bytes),
                 commit_charge_bytes,
                 commit_limit_bytes,
             },
             processes,
+            history,
         }
     }
 
     fn collect_processes(&mut self) -> Vec<ProcessSnapshot> {
         let mut live_processes = HashSet::new();
         let (system, command_lines) = (&self.system, &mut self.command_lines);
+        let logical_cpu_count = system.cpus().len();
         let mut processes = system
             .processes()
             .values()
@@ -106,7 +124,10 @@ impl Collector {
                     name: process.name().to_string_lossy().into_owned(),
                     command_line: cached_command_line(command_lines, identity, process),
                     executable_path: process.exe().map(ToOwned::to_owned),
-                    cpu_percent: process.cpu_usage(),
+                    cpu_percent: normalize_process_cpu_percent(
+                        process.cpu_usage(),
+                        logical_cpu_count,
+                    ),
                     memory_bytes: process.memory(),
                 }
             })
@@ -147,6 +168,25 @@ impl Collector {
                 .with_cmd(UpdateKind::Always)
                 .with_exe(UpdateKind::Always),
         );
+    }
+}
+
+/// Converts sysinfo's per-logical-CPU process usage into a percentage of the
+/// whole machine, matching the system CPU metric displayed in the header.
+fn normalize_process_cpu_percent(raw_percent: f32, logical_cpu_count: usize) -> f32 {
+    if !raw_percent.is_finite() {
+        return 0.0;
+    }
+
+    let logical_cpu_count = logical_cpu_count.max(1) as f32;
+    (raw_percent / logical_cpu_count).clamp(0.0, 100.0)
+}
+
+fn normalize_system_cpu_percent(raw_percent: f32) -> f32 {
+    if raw_percent.is_finite() {
+        raw_percent.clamp(0.0, 100.0)
+    } else {
+        0.0
     }
 }
 
@@ -218,7 +258,10 @@ fn pages_to_bytes(pages: usize, page_size: usize) -> Result<u64, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Collector, command_line_from_arguments, pages_to_bytes, stale_metric};
+    use super::{
+        Collector, command_line_from_arguments, normalize_process_cpu_percent,
+        normalize_system_cpu_percent, pages_to_bytes, stale_metric,
+    };
     use crate::model::{CommandLine, Freshness, Metric};
 
     #[test]
@@ -255,5 +298,39 @@ mod tests {
         let second = collector.collect(Some(&first));
 
         assert_eq!(second.generation, first.generation + 1);
+    }
+
+    #[test]
+    fn process_cpu_is_normalized_to_total_machine_capacity() {
+        assert_eq!(normalize_process_cpu_percent(250.0, 8), 31.25);
+        assert_eq!(normalize_process_cpu_percent(1_600.0, 8), 100.0);
+        assert_eq!(normalize_process_cpu_percent(50.0, 0), 50.0);
+        assert_eq!(normalize_process_cpu_percent(f32::NAN, 8), 0.0);
+    }
+
+    #[test]
+    fn logical_cpu_readings_are_clamped_and_non_finite_values_are_safe() {
+        assert_eq!(normalize_system_cpu_percent(-1.0), 0.0);
+        assert_eq!(normalize_system_cpu_percent(101.0), 100.0);
+        assert_eq!(normalize_system_cpu_percent(f32::NAN), 0.0);
+    }
+
+    #[test]
+    fn collector_records_one_history_sample_per_refresh() {
+        let mut collector = Collector::new();
+        let first = collector.collect(None);
+        let second = collector.collect(Some(&first));
+
+        assert_eq!(second.history.len(), 2);
+        let newest = second
+            .history
+            .samples()
+            .next_back()
+            .expect("a sample was appended");
+        assert_eq!(second.system.cpu_percent.value, newest.cpu_percent);
+        assert_eq!(
+            second.system.logical_cpu_percentages.value.len(),
+            collector.system.cpus().len()
+        );
     }
 }
