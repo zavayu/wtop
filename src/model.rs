@@ -51,6 +51,7 @@ impl<T> Metric<T> {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProcessSnapshot {
     pub pid: u32,
+    pub parent_pid: Option<u32>,
     pub name: String,
     pub command_line: CommandLine,
     pub executable_path: Option<PathBuf>,

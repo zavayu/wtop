@@ -6,7 +6,7 @@ use ratatui::{
 };
 
 use crate::{
-    app::{App, SortColumn, SortDirection},
+    app::{App, ProcessRow, ProcessViewMode, SortColumn, SortDirection},
     model::{Freshness, Metric, ProcessSnapshot, Snapshot, SystemSnapshot},
     text::scroll_text,
 };
@@ -54,9 +54,10 @@ pub fn render(frame: &mut Frame, app: &App) {
 
     let command_line_width = command_line_viewport_cells(area);
     let table = Table::new(
-        app.viewport_processes().into_iter().map(|process| {
+        app.viewport_process_rows().into_iter().map(|row| {
             process_row(
-                process,
+                &row,
+                app.view_mode(),
                 app.selected_pid(),
                 app.command_line_offset_cells(),
                 command_line_width,
@@ -148,11 +149,13 @@ fn system_summary(system: Option<&SystemSnapshot>) -> String {
 }
 
 fn process_row(
-    process: &ProcessSnapshot,
+    row: &ProcessRow<'_>,
+    view_mode: ProcessViewMode,
     selected_pid: Option<u32>,
     selected_command_line_offset: u16,
     command_line_width: u16,
 ) -> Row<'static> {
+    let process = row.process;
     let command_line_offset = if selected_pid == Some(process.pid) {
         selected_command_line_offset
     } else {
@@ -160,7 +163,7 @@ fn process_row(
     };
     Row::new(vec![
         Cell::from(process.pid.to_string()),
-        Cell::from(process.name.clone()),
+        Cell::from(process_name(row, view_mode)),
         Cell::from(format_percent_value(process.cpu_percent)),
         Cell::from(format_bytes(process.memory_bytes)),
         Cell::from(scroll_text(
@@ -171,6 +174,25 @@ fn process_row(
     ])
 }
 
+fn process_name(row: &ProcessRow<'_>, view_mode: ProcessViewMode) -> String {
+    if view_mode == ProcessViewMode::Flat {
+        return row.process.name.clone();
+    }
+
+    let ancestor_guides = row
+        .ancestor_has_next_siblings
+        .iter()
+        .map(|has_next_sibling| if *has_next_sibling { "│   " } else { "    " })
+        .collect::<String>();
+    let branch = if row.is_last_sibling { '└' } else { '├' };
+    let marker = if row.has_children {
+        if row.is_expanded { "▾ " } else { "▸ " }
+    } else {
+        "─ "
+    };
+    format!("{ancestor_guides}{branch}─{marker}{}", row.process.name)
+}
+
 fn process_table_title(app: &App) -> String {
     let sort = app.sort();
     let filter = if app.filter().is_empty() {
@@ -179,7 +201,8 @@ fn process_table_title(app: &App) -> String {
         format!(" / {}", app.filter())
     };
     format!(
-        " Processes [{}{}]{} ",
+        " Processes [{} · {}{}]{} ",
+        view_mode_label(app.view_mode()),
         sort_column_label(sort.column),
         sort_direction_indicator(sort.direction),
         filter,
@@ -203,12 +226,23 @@ fn footer_text(app: &App) -> String {
             app.filter()
         )
     } else if app.filter().is_empty() {
-        format!("{stale_prefix}s Sort  S Reverse  / Filter  q Quit")
+        if app.view_mode() == ProcessViewMode::Tree {
+            format!("{stale_prefix}t Flat  Enter/Space Collapse  s Sort  / Filter  q Quit")
+        } else {
+            format!("{stale_prefix}t Tree  s Sort  S Reverse  / Filter  q Quit")
+        }
     } else {
         format!(
-            "{stale_prefix}Filter: {}  s Sort  S Reverse  / Edit  q Quit",
+            "{stale_prefix}Filter: {}  t View  s Sort  S Reverse  / Edit  q Quit",
             app.filter()
         )
+    }
+}
+
+fn view_mode_label(view_mode: ProcessViewMode) -> &'static str {
+    match view_mode {
+        ProcessViewMode::Flat => "Flat",
+        ProcessViewMode::Tree => "Tree",
     }
 }
 
@@ -288,8 +322,10 @@ mod tests {
 
     use super::{
         MINIMUM_HEIGHT, MINIMUM_WIDTH, command_line_viewport_cells, format_bytes,
-        format_command_line, format_percent, process_table_row_capacity, terminal_is_too_small,
+        format_command_line, format_percent, process_name, process_table_row_capacity,
+        terminal_is_too_small,
     };
+    use crate::app::{ProcessRow, ProcessViewMode};
     use crate::model::{CommandLine, Freshness, Metric, ProcessSnapshot};
     use ratatui::layout::Rect;
 
@@ -316,6 +352,7 @@ mod tests {
     fn unavailable_command_lines_fall_back_to_the_executable_path() {
         let process = ProcessSnapshot {
             pid: 1,
+            parent_pid: None,
             name: "example.exe".into(),
             command_line: CommandLine::Unavailable,
             executable_path: Some(PathBuf::from(r"C:\Tools\example.exe")),
@@ -348,5 +385,41 @@ mod tests {
         assert_eq!(command_line_viewport_cells(Rect::new(0, 0, 60, 10)), 14);
         assert_eq!(command_line_viewport_cells(Rect::new(0, 0, 100, 24)), 54);
         assert_eq!(command_line_viewport_cells(Rect::new(0, 0, 59, 24)), 0);
+    }
+
+    #[test]
+    fn tree_names_use_branch_connectors_and_ancestor_guides() {
+        let process = ProcessSnapshot {
+            pid: 1,
+            parent_pid: None,
+            name: "worker.exe".into(),
+            command_line: CommandLine::NotRequested,
+            executable_path: None,
+            cpu_percent: 0.0,
+            memory_bytes: 0,
+        };
+        let branch = ProcessRow {
+            process: &process,
+            ancestor_has_next_siblings: Vec::new(),
+            is_last_sibling: false,
+            has_children: true,
+            is_expanded: true,
+        };
+        let leaf = ProcessRow {
+            process: &process,
+            ancestor_has_next_siblings: vec![true, false],
+            is_last_sibling: true,
+            has_children: false,
+            is_expanded: false,
+        };
+
+        assert_eq!(
+            process_name(&branch, ProcessViewMode::Tree),
+            "├─▾ worker.exe"
+        );
+        assert_eq!(
+            process_name(&leaf, ProcessViewMode::Tree),
+            "│       └── worker.exe"
+        );
     }
 }

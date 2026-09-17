@@ -102,6 +102,7 @@ impl Collector {
 
                 ProcessSnapshot {
                     pid: identity.pid,
+                    parent_pid: process.parent().map(|pid| pid.as_u32()),
                     name: process.name().to_string_lossy().into_owned(),
                     command_line: cached_command_line(command_lines, identity, process),
                     executable_path: process.exe().map(ToOwned::to_owned),

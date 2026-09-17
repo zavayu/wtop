@@ -12,7 +12,9 @@ terminal UI.
   charge/limit.
 - Selection, vertical process-list scrolling, and command-line scrolling that
   preserves Unicode display-cell boundaries.
-- Process sorting and live case-insensitive filtering.
+- Flat and parent/child tree process views, with expandable process groups.
+- Process sorting and live case-insensitive filtering; tree filters retain the
+  ancestors of matching processes for context.
 - Safe resize behavior, a 60 columns by 10 rows minimum-size message, and
   terminal restoration on exit.
 
@@ -48,6 +50,8 @@ wtop
 | `Page Up` / `Page Down` | Move by one visible page |
 | `Home` / `End` | Select the first / last visible process |
 | `Left` / `Right` | Scroll the selected command line |
+| `t` | Toggle flat and tree process views |
+| `Enter` or `Space` | Expand or collapse the selected tree process |
 | `s` | Cycle PID, name, CPU, and memory sorting |
 | `S` | Reverse the active sort direction |
 | `/` | Edit a filter; it applies as you type |
@@ -70,9 +74,8 @@ line is shown as `<unavailable>` when it cannot be read, with an executable-path
 fallback when available. Running from an elevated terminal can reveal more
 details, but does not guarantee access to protected processes.
 
-wtop does not alter processes. Process trees, termination, priority changes,
-saved views, custom columns, and disk/network/GPU metrics are outside this
-first milestone.
+wtop does not alter processes. Termination, priority changes, saved views,
+custom columns, and disk/network/GPU metrics are outside this first milestone.
 
 ## Validate a build
 
@@ -93,7 +96,8 @@ PowerShell or Windows Terminal session:
 - Confirm values and the process list refresh without blocking navigation.
 - Move through a process list taller than the terminal and inspect a long
   command line with `Left` and `Right`.
-- Sort with `s`/`S`; filter with `/`; accept, cancel, and clear a filter.
+- Toggle tree mode with `t`, expand/collapse with `Enter` or `Space`, then sort
+  with `s`/`S` and filter with `/`; accept, cancel, and clear a filter.
 - Resize the terminal, including to 60 columns by 10 rows, then quit with
   `q`, `Esc`, and `Ctrl+C` to confirm terminal restoration.
 - Confirm protected processes remain visible even when command-line details are

@@ -1,4 +1,7 @@
-use std::sync::Arc;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use crossterm::event::{KeyCode, KeyModifiers};
 
@@ -20,6 +23,8 @@ pub struct App {
     viewport_rows: usize,
     command_line_offset_cells: u16,
     command_line_viewport_cells: u16,
+    view_mode: ProcessViewMode,
+    collapsed_pids: HashSet<u32>,
     sort: SortSpec,
     filter: String,
     filter_before_edit: Option<String>,
@@ -48,6 +53,27 @@ pub enum SortDirection {
 pub struct SortSpec {
     pub column: SortColumn,
     pub direction: SortDirection,
+}
+
+/// Chooses whether the process table is a sorted list or a parent/child tree.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ProcessViewMode {
+    #[default]
+    Flat,
+    Tree,
+}
+
+/// One rendered process row, enriched with tree-only presentation state.
+#[derive(Clone, Debug)]
+pub struct ProcessRow<'a> {
+    pub process: &'a ProcessSnapshot,
+    /// For every ancestor, whether another sibling follows it and therefore
+    /// needs a vertical continuation guide in the rendered tree.
+    pub ancestor_has_next_siblings: Vec<bool>,
+    /// Whether this row is the final sibling at its level.
+    pub is_last_sibling: bool,
+    pub has_children: bool,
+    pub is_expanded: bool,
 }
 
 impl App {
@@ -83,6 +109,19 @@ impl App {
 
     pub fn command_line_offset_cells(&self) -> u16 {
         self.command_line_offset_cells
+    }
+
+    pub fn view_mode(&self) -> ProcessViewMode {
+        self.view_mode
+    }
+
+    pub fn toggle_view_mode(&mut self) {
+        let previous_index = self.selected_index();
+        self.view_mode = match self.view_mode {
+            ProcessViewMode::Flat => ProcessViewMode::Tree,
+            ProcessViewMode::Tree => ProcessViewMode::Flat,
+        };
+        self.reconcile_selection(previous_index);
     }
 
     pub fn set_command_line_offset_cells(&mut self, offset: u16) {
@@ -152,6 +191,7 @@ impl App {
             KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
             KeyCode::Char('s') => self.cycle_sort_column(),
             KeyCode::Char('S') => self.reverse_sort_direction(),
+            KeyCode::Char('t') => self.toggle_view_mode(),
             KeyCode::Char('/') => self.begin_filter_edit(),
             KeyCode::Up => self.move_selection_by(-1),
             KeyCode::Down => self.move_selection_by(1),
@@ -164,6 +204,7 @@ impl App {
             }
             KeyCode::Left => self.move_command_line_left(),
             KeyCode::Right => self.move_command_line_right(),
+            KeyCode::Enter | KeyCode::Char(' ') => self.toggle_selected_expansion(),
             _ => {}
         }
     }
@@ -207,6 +248,13 @@ impl App {
     /// whenever that process still exists in the new visible list.
     pub fn set_snapshot(&mut self, snapshot: Arc<Snapshot>) {
         let previous_index = self.selected_index();
+        self.collapsed_pids.retain(|pid| {
+            snapshot
+                .processes
+                .value
+                .iter()
+                .any(|process| process.pid == *pid)
+        });
         self.snapshot = Some(snapshot);
         self.reconcile_selection(previous_index);
     }
@@ -228,45 +276,60 @@ impl App {
         }
     }
 
-    /// Returns processes after applying the current filter and sort settings.
-    pub fn visible_processes(&self) -> Vec<&ProcessSnapshot> {
+    /// Returns process rows after applying the current view, filter, and sort
+    /// settings. Tree rows preserve ancestry while flat rows have depth zero.
+    pub fn visible_rows(&self) -> Vec<ProcessRow<'_>> {
         let Some(snapshot) = &self.snapshot else {
             return Vec::new();
         };
 
         let filter = self.filter.to_lowercase();
-        let mut processes = snapshot
-            .processes
-            .value
-            .iter()
-            .filter(|process| process_matches_filter(process, &filter))
-            .collect::<Vec<_>>();
+        match self.view_mode {
+            ProcessViewMode::Flat => {
+                let mut processes = matching_processes(&snapshot.processes.value, &filter);
+                sort_processes(&mut processes, self.sort);
+                processes
+                    .into_iter()
+                    .map(|process| ProcessRow {
+                        process,
+                        ancestor_has_next_siblings: Vec::new(),
+                        is_last_sibling: true,
+                        has_children: false,
+                        is_expanded: false,
+                    })
+                    .collect()
+            }
+            ProcessViewMode::Tree => tree_rows(
+                &snapshot.processes.value,
+                &filter,
+                self.sort,
+                &self.collapsed_pids,
+            ),
+        }
+    }
 
-        processes.sort_by(|left, right| {
-            let comparison = match self.sort.column {
-                SortColumn::Pid => left.pid.cmp(&right.pid),
-                SortColumn::Name => left.name.to_lowercase().cmp(&right.name.to_lowercase()),
-                SortColumn::CpuPercent => left.cpu_percent.total_cmp(&right.cpu_percent),
-                SortColumn::Memory => left.memory_bytes.cmp(&right.memory_bytes),
-            };
-
-            let comparison = match self.sort.direction {
-                SortDirection::Ascending => comparison,
-                SortDirection::Descending => comparison.reverse(),
-            };
-
-            comparison.then_with(|| left.pid.cmp(&right.pid))
-        });
-
-        processes
+    /// Returns visible processes without tree presentation data.
+    pub fn visible_processes(&self) -> Vec<&ProcessSnapshot> {
+        self.visible_rows()
+            .into_iter()
+            .map(|row| row.process)
+            .collect()
     }
 
     /// Returns just the process rows that fit in the current table viewport.
-    pub fn viewport_processes(&self) -> Vec<&ProcessSnapshot> {
-        self.visible_processes()
+    pub fn viewport_process_rows(&self) -> Vec<ProcessRow<'_>> {
+        self.visible_rows()
             .into_iter()
             .skip(self.vertical_offset)
             .take(self.viewport_rows)
+            .collect()
+    }
+
+    /// Returns the visible viewport without tree presentation data.
+    pub fn viewport_processes(&self) -> Vec<&ProcessSnapshot> {
+        self.viewport_process_rows()
+            .into_iter()
+            .map(|row| row.process)
             .collect()
     }
 
@@ -309,6 +372,29 @@ impl App {
             }
             self.ensure_selected_row_is_visible();
         }
+    }
+
+    fn toggle_selected_expansion(&mut self) {
+        if self.view_mode != ProcessViewMode::Tree {
+            return;
+        }
+
+        let Some(selected_pid) = self.selected_pid else {
+            return;
+        };
+        let has_children = self
+            .visible_rows()
+            .into_iter()
+            .find(|row| row.process.pid == selected_pid)
+            .is_some_and(|row| row.has_children);
+        if !has_children {
+            return;
+        }
+
+        if !self.collapsed_pids.insert(selected_pid) {
+            self.collapsed_pids.remove(&selected_pid);
+        }
+        self.ensure_selected_row_is_visible();
     }
 
     fn move_command_line_left(&mut self) {
@@ -407,6 +493,247 @@ impl SortSpec {
     }
 }
 
+fn matching_processes<'a>(
+    processes: &'a [ProcessSnapshot],
+    lowercase_filter: &str,
+) -> Vec<&'a ProcessSnapshot> {
+    processes
+        .iter()
+        .filter(|process| process_matches_filter(process, lowercase_filter))
+        .collect()
+}
+
+fn tree_rows<'a>(
+    processes: &'a [ProcessSnapshot],
+    lowercase_filter: &str,
+    sort: SortSpec,
+    collapsed_pids: &HashSet<u32>,
+) -> Vec<ProcessRow<'a>> {
+    let processes_by_pid = processes
+        .iter()
+        .map(|process| (process.pid, process))
+        .collect::<HashMap<_, _>>();
+    let included_pids = tree_filter_pids(&processes_by_pid, lowercase_filter);
+    let (mut root_pids, mut child_pids) = tree_relationships(&processes_by_pid);
+    let no_collapsed_pids = HashSet::new();
+    let effective_collapsed_pids = if lowercase_filter.is_empty() {
+        collapsed_pids
+    } else {
+        &no_collapsed_pids
+    };
+
+    sort_process_ids(&mut root_pids, &processes_by_pid, sort);
+    for children in child_pids.values_mut() {
+        sort_process_ids(children, &processes_by_pid, sort);
+    }
+
+    let mut rows = Vec::with_capacity(included_pids.len());
+    let mut visited_pids = HashSet::new();
+    let mut root_connected_pids = HashSet::new();
+    for pid in &root_pids {
+        mark_tree_component(*pid, &child_pids, &mut root_connected_pids);
+    }
+    // A parent cycle has no natural root. Traversing every remaining PID makes
+    // such a component visible without risking recursion loops.
+    let mut remaining_pids = processes_by_pid.keys().copied().collect::<Vec<_>>();
+    sort_process_ids(&mut remaining_pids, &processes_by_pid, sort);
+    let mut top_level_pids = root_pids
+        .into_iter()
+        .filter(|pid| included_pids.contains(pid))
+        .collect::<Vec<_>>();
+    top_level_pids.extend(
+        remaining_pids
+            .into_iter()
+            .filter(|pid| !root_connected_pids.contains(pid) && included_pids.contains(pid)),
+    );
+
+    let top_level_count = top_level_pids.len();
+    for (index, pid) in top_level_pids.into_iter().enumerate() {
+        append_tree_rows(
+            pid,
+            &[],
+            index + 1 == top_level_count,
+            &processes_by_pid,
+            &child_pids,
+            &included_pids,
+            effective_collapsed_pids,
+            &mut visited_pids,
+            &mut rows,
+        );
+    }
+
+    rows
+}
+
+fn mark_tree_component(
+    pid: u32,
+    child_pids: &HashMap<u32, Vec<u32>>,
+    marked_pids: &mut HashSet<u32>,
+) {
+    if !marked_pids.insert(pid) {
+        return;
+    }
+
+    if let Some(children) = child_pids.get(&pid) {
+        for child_pid in children {
+            mark_tree_component(*child_pid, child_pids, marked_pids);
+        }
+    }
+}
+
+fn tree_filter_pids(
+    processes_by_pid: &HashMap<u32, &ProcessSnapshot>,
+    lowercase_filter: &str,
+) -> HashSet<u32> {
+    if lowercase_filter.is_empty() {
+        return processes_by_pid.keys().copied().collect();
+    }
+
+    let mut included_pids = HashSet::new();
+    for process in processes_by_pid.values().copied() {
+        if !process_matches_filter(process, lowercase_filter) {
+            continue;
+        }
+
+        let mut ancestor_pid = Some(process.pid);
+        let mut ancestors_seen = HashSet::new();
+        while let Some(pid) = ancestor_pid {
+            if !ancestors_seen.insert(pid) {
+                break;
+            }
+
+            let Some(ancestor) = processes_by_pid.get(&pid) else {
+                break;
+            };
+            included_pids.insert(pid);
+            ancestor_pid = ancestor.parent_pid;
+        }
+    }
+
+    included_pids
+}
+
+fn tree_relationships(
+    processes_by_pid: &HashMap<u32, &ProcessSnapshot>,
+) -> (Vec<u32>, HashMap<u32, Vec<u32>>) {
+    let mut root_pids = Vec::new();
+    let mut child_pids = HashMap::<u32, Vec<u32>>::new();
+
+    for process in processes_by_pid.values().copied() {
+        let parent_pid = process.parent_pid.filter(|parent_pid| {
+            *parent_pid != process.pid && processes_by_pid.contains_key(parent_pid)
+        });
+        if let Some(parent_pid) = parent_pid {
+            child_pids.entry(parent_pid).or_default().push(process.pid);
+        } else {
+            root_pids.push(process.pid);
+        }
+    }
+
+    (root_pids, child_pids)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_tree_rows<'a>(
+    pid: u32,
+    ancestor_has_next_siblings: &[bool],
+    is_last_sibling: bool,
+    processes_by_pid: &HashMap<u32, &'a ProcessSnapshot>,
+    child_pids: &HashMap<u32, Vec<u32>>,
+    included_pids: &HashSet<u32>,
+    collapsed_pids: &HashSet<u32>,
+    visited_pids: &mut HashSet<u32>,
+    rows: &mut Vec<ProcessRow<'a>>,
+) {
+    if !included_pids.contains(&pid) || !visited_pids.insert(pid) {
+        return;
+    }
+
+    let Some(process) = processes_by_pid.get(&pid).copied() else {
+        return;
+    };
+    let visible_children = child_pids
+        .get(&pid)
+        .map(|children| {
+            children
+                .iter()
+                .copied()
+                .filter(|child_pid| included_pids.contains(child_pid))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let has_children = !visible_children.is_empty();
+    let is_expanded = has_children && !collapsed_pids.contains(&pid);
+    rows.push(ProcessRow {
+        process,
+        ancestor_has_next_siblings: ancestor_has_next_siblings.to_vec(),
+        is_last_sibling,
+        has_children,
+        is_expanded,
+    });
+
+    if is_expanded {
+        let mut child_ancestor_has_next_siblings = ancestor_has_next_siblings.to_vec();
+        child_ancestor_has_next_siblings.push(!is_last_sibling);
+        let child_count = visible_children.len();
+        for (index, child_pid) in visible_children.into_iter().enumerate() {
+            append_tree_rows(
+                child_pid,
+                &child_ancestor_has_next_siblings,
+                index + 1 == child_count,
+                processes_by_pid,
+                child_pids,
+                included_pids,
+                collapsed_pids,
+                visited_pids,
+                rows,
+            );
+        }
+    }
+}
+
+fn sort_process_ids(
+    process_ids: &mut [u32],
+    processes_by_pid: &HashMap<u32, &ProcessSnapshot>,
+    sort: SortSpec,
+) {
+    process_ids.sort_by(|left_pid, right_pid| {
+        compare_processes(
+            processes_by_pid
+                .get(left_pid)
+                .expect("tree references a known process"),
+            processes_by_pid
+                .get(right_pid)
+                .expect("tree references a known process"),
+            sort,
+        )
+    });
+}
+
+fn sort_processes(processes: &mut [&ProcessSnapshot], sort: SortSpec) {
+    processes.sort_by(|left, right| compare_processes(left, right, sort));
+}
+
+fn compare_processes(
+    left: &ProcessSnapshot,
+    right: &ProcessSnapshot,
+    sort: SortSpec,
+) -> std::cmp::Ordering {
+    let comparison = match sort.column {
+        SortColumn::Pid => left.pid.cmp(&right.pid),
+        SortColumn::Name => left.name.to_lowercase().cmp(&right.name.to_lowercase()),
+        SortColumn::CpuPercent => left.cpu_percent.total_cmp(&right.cpu_percent),
+        SortColumn::Memory => left.memory_bytes.cmp(&right.memory_bytes),
+    };
+
+    let comparison = match sort.direction {
+        SortDirection::Ascending => comparison,
+        SortDirection::Descending => comparison.reverse(),
+    };
+
+    comparison.then_with(|| left.pid.cmp(&right.pid))
+}
+
 fn process_matches_filter(process: &ProcessSnapshot, lowercase_filter: &str) -> bool {
     if lowercase_filter.is_empty() || process.name.to_lowercase().contains(lowercase_filter) {
         return true;
@@ -422,7 +749,7 @@ fn process_matches_filter(process: &ProcessSnapshot, lowercase_filter: &str) -> 
 mod tests {
     use std::{sync::Arc, time::Instant};
 
-    use super::{App, SortColumn, SortDirection, SortSpec};
+    use super::{App, ProcessViewMode, SortColumn, SortDirection, SortSpec};
     use crate::model::{CommandLine, Metric, ProcessSnapshot, Snapshot, SystemSnapshot};
     use crossterm::event::{KeyCode, KeyModifiers};
 
@@ -434,12 +761,19 @@ mod tests {
     ) -> ProcessSnapshot {
         ProcessSnapshot {
             pid,
+            parent_pid: None,
             name: name.into(),
             command_line,
             executable_path: None,
             cpu_percent,
             memory_bytes: u64::from(pid) * 1024,
         }
+    }
+
+    fn process_with_parent(pid: u32, parent_pid: Option<u32>, name: &str) -> ProcessSnapshot {
+        let mut process = process(pid, name, CommandLine::NotRequested, 0.0);
+        process.parent_pid = parent_pid;
+        process
     }
 
     fn snapshot(processes: Vec<ProcessSnapshot>) -> Arc<Snapshot> {
@@ -808,5 +1142,132 @@ mod tests {
         app.set_filter("föö");
 
         assert_eq!(app.visible_processes()[0].pid, 1);
+    }
+
+    #[test]
+    fn tree_mode_orders_children_beneath_their_parent() {
+        let mut app = App::new();
+        app.set_snapshot(snapshot(vec![
+            process_with_parent(1, None, "root.exe"),
+            process_with_parent(2, Some(1), "parent.exe"),
+            process_with_parent(3, Some(1), "sibling.exe"),
+            process_with_parent(4, Some(2), "grandchild.exe"),
+            process_with_parent(5, Some(99), "orphan.exe"),
+        ]));
+
+        app.toggle_view_mode();
+
+        assert_eq!(app.view_mode(), ProcessViewMode::Tree);
+        assert_eq!(
+            app.visible_rows()
+                .into_iter()
+                .map(|row| (row.process.pid, row.ancestor_has_next_siblings.len()))
+                .collect::<Vec<_>>(),
+            vec![(1, 0), (2, 1), (4, 2), (3, 1), (5, 0)]
+        );
+    }
+
+    #[test]
+    fn tree_mode_sorts_siblings_without_reordering_ancestry() {
+        let mut app = App::new();
+        app.set_snapshot(snapshot(vec![
+            process_with_parent(1, None, "root.exe"),
+            process_with_parent(2, Some(1), "zebra.exe"),
+            process_with_parent(3, Some(1), "alpha.exe"),
+        ]));
+        app.set_sort(SortSpec {
+            column: SortColumn::Name,
+            direction: SortDirection::Ascending,
+        });
+
+        app.toggle_view_mode();
+
+        assert_eq!(
+            app.visible_processes()
+                .into_iter()
+                .map(|process| process.pid)
+                .collect::<Vec<_>>(),
+            vec![1, 3, 2]
+        );
+    }
+
+    #[test]
+    fn tree_filter_keeps_matching_process_ancestors() {
+        let mut app = App::new();
+        app.set_snapshot(snapshot(vec![
+            process_with_parent(1, None, "root.exe"),
+            process_with_parent(2, Some(1), "worker.exe"),
+            process_with_parent(3, Some(1), "other.exe"),
+        ]));
+        app.toggle_view_mode();
+        app.set_filter("worker");
+
+        assert_eq!(
+            app.visible_processes()
+                .into_iter()
+                .map(|process| process.pid)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+    }
+
+    #[test]
+    fn tree_rows_expand_and_collapse_with_the_selected_parent() {
+        let mut app = App::new();
+        app.set_snapshot(snapshot(vec![
+            process_with_parent(1, None, "root.exe"),
+            process_with_parent(2, Some(1), "child.exe"),
+        ]));
+        app.toggle_view_mode();
+
+        app.handle_key(KeyCode::Enter);
+        assert_eq!(
+            app.visible_processes()
+                .into_iter()
+                .map(|process| process.pid)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+
+        app.set_filter("child");
+        assert_eq!(
+            app.visible_processes()
+                .into_iter()
+                .map(|process| process.pid)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        app.set_filter("");
+
+        app.handle_key(KeyCode::Char(' '));
+        assert_eq!(
+            app.visible_processes()
+                .into_iter()
+                .map(|process| process.pid)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+    }
+
+    #[test]
+    fn tree_mode_tolerates_cycles_and_missing_parents() {
+        let mut app = App::new();
+        app.set_snapshot(snapshot(vec![
+            process_with_parent(1, Some(2), "cycle-a.exe"),
+            process_with_parent(2, Some(1), "cycle-b.exe"),
+            process_with_parent(3, Some(99), "orphan.exe"),
+        ]));
+
+        app.toggle_view_mode();
+
+        let pids = app
+            .visible_processes()
+            .into_iter()
+            .map(|process| process.pid)
+            .collect::<Vec<_>>();
+        assert_eq!(pids.len(), 3);
+        assert!(pids.contains(&1));
+        assert!(pids.contains(&2));
+        assert!(pids.contains(&3));
     }
 }
