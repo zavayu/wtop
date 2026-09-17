@@ -39,8 +39,11 @@ pub fn render(frame: &mut Frame) {
         ],
     )
     .header(
-        Row::new(["PID", "NAME", "CPU", "MEMORY", "COMMAND LINE"])
-            .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Row::new(["PID", "NAME", "CPU", "MEMORY", "COMMAND LINE"]).style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
     )
     .block(Block::default().borders(Borders::ALL).title(" Processes "));
     frame.render_widget(table, sections[1]);
