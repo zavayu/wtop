@@ -1,0 +1,14 @@
+# Rust build artifacts
+/target/
+
+# Rust compiler backup files
+**/*.rs.bk
+
+# Editor settings local to a developer machine
+/.idea/
+/.vscode/
+
+# Operating-system metadata
+.DS_Store
+Thumbs.db
+Desktop.ini
