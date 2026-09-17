@@ -51,7 +51,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                         break;
                     }
 
-                    app.handle_key(key.code);
+                    app.handle_key_with_modifiers(key.code, key.modifiers);
                 }
                 // A resize event wakes the loop, and the next iteration redraws at
                 // the new terminal dimensions.

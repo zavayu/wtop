@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crossterm::event::KeyCode;
+use crossterm::event::{KeyCode, KeyModifiers};
 
 use crate::{
     model::{CommandLine, ProcessSnapshot, Snapshot},
@@ -22,6 +22,7 @@ pub struct App {
     command_line_viewport_cells: u16,
     sort: SortSpec,
     filter: String,
+    filter_before_edit: Option<String>,
 }
 
 /// The supported sort keys for the first milestone's process table.
@@ -104,14 +105,102 @@ impl App {
         self.reconcile_selection(previous_index);
     }
 
+    pub fn cycle_sort_column(&mut self) {
+        let next_column = match self.sort.column {
+            SortColumn::Pid => SortColumn::Name,
+            SortColumn::Name => SortColumn::CpuPercent,
+            SortColumn::CpuPercent => SortColumn::Memory,
+            SortColumn::Memory => SortColumn::Pid,
+        };
+        self.set_sort(SortSpec::for_column(next_column));
+    }
+
+    pub fn reverse_sort_direction(&mut self) {
+        let direction = match self.sort.direction {
+            SortDirection::Ascending => SortDirection::Descending,
+            SortDirection::Descending => SortDirection::Ascending,
+        };
+        self.set_sort(SortSpec {
+            column: self.sort.column,
+            direction,
+        });
+    }
+
     pub fn filter(&self) -> &str {
         &self.filter
     }
 
+    pub fn is_filter_editing(&self) -> bool {
+        self.filter_before_edit.is_some()
+    }
+
     pub fn set_filter(&mut self, filter: impl Into<String>) {
+        self.apply_filter(filter.into());
+    }
+
+    pub fn handle_key(&mut self, key: KeyCode) {
+        self.handle_key_with_modifiers(key, KeyModifiers::NONE);
+    }
+
+    pub fn handle_key_with_modifiers(&mut self, key: KeyCode, modifiers: KeyModifiers) {
+        if self.is_filter_editing() {
+            self.handle_filter_key(key, modifiers);
+            return;
+        }
+
+        match key {
+            KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
+            KeyCode::Char('s') => self.cycle_sort_column(),
+            KeyCode::Char('S') => self.reverse_sort_direction(),
+            KeyCode::Char('/') => self.begin_filter_edit(),
+            KeyCode::Up => self.move_selection_by(-1),
+            KeyCode::Down => self.move_selection_by(1),
+            KeyCode::PageUp => self.move_selection_by(-(self.page_size() as isize)),
+            KeyCode::PageDown => self.move_selection_by(self.page_size() as isize),
+            KeyCode::Home => self.move_selection_to(0),
+            KeyCode::End => {
+                let last_index = self.visible_processes().len().saturating_sub(1);
+                self.move_selection_to(last_index);
+            }
+            KeyCode::Left => self.move_command_line_left(),
+            KeyCode::Right => self.move_command_line_right(),
+            _ => {}
+        }
+    }
+
+    fn apply_filter(&mut self, filter: String) {
         let previous_index = self.selected_index();
-        self.filter = filter.into();
+        self.filter = filter;
         self.reconcile_selection(previous_index);
+    }
+
+    fn begin_filter_edit(&mut self) {
+        self.filter_before_edit = Some(self.filter.clone());
+    }
+
+    fn handle_filter_key(&mut self, key: KeyCode, modifiers: KeyModifiers) {
+        match key {
+            KeyCode::Enter => self.filter_before_edit = None,
+            KeyCode::Esc => {
+                if let Some(previous_filter) = self.filter_before_edit.take() {
+                    self.apply_filter(previous_filter);
+                }
+            }
+            KeyCode::Backspace => {
+                let mut filter = self.filter.clone();
+                filter.pop();
+                self.apply_filter(filter);
+            }
+            KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => {
+                self.apply_filter(String::new());
+            }
+            KeyCode::Char(character) if !modifiers.contains(KeyModifiers::CONTROL) => {
+                let mut filter = self.filter.clone();
+                filter.push(character);
+                self.apply_filter(filter);
+            }
+            _ => {}
+        }
     }
 
     /// Replaces the current immutable snapshot and preserves selection by PID
@@ -186,24 +275,6 @@ impl App {
         self.selected_index()
             .and_then(|index| index.checked_sub(self.vertical_offset))
             .filter(|index| *index < self.viewport_rows)
-    }
-
-    pub fn handle_key(&mut self, key: KeyCode) {
-        match key {
-            KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
-            KeyCode::Up => self.move_selection_by(-1),
-            KeyCode::Down => self.move_selection_by(1),
-            KeyCode::PageUp => self.move_selection_by(-(self.page_size() as isize)),
-            KeyCode::PageDown => self.move_selection_by(self.page_size() as isize),
-            KeyCode::Home => self.move_selection_to(0),
-            KeyCode::End => {
-                let last_index = self.visible_processes().len().saturating_sub(1);
-                self.move_selection_to(last_index);
-            }
-            KeyCode::Left => self.move_command_line_left(),
-            KeyCode::Right => self.move_command_line_right(),
-            _ => {}
-        }
     }
 
     fn page_size(&self) -> usize {
@@ -326,6 +397,16 @@ impl App {
     }
 }
 
+impl SortSpec {
+    fn for_column(column: SortColumn) -> Self {
+        let direction = match column {
+            SortColumn::Pid | SortColumn::Name => SortDirection::Ascending,
+            SortColumn::CpuPercent | SortColumn::Memory => SortDirection::Descending,
+        };
+        Self { column, direction }
+    }
+}
+
 fn process_matches_filter(process: &ProcessSnapshot, lowercase_filter: &str) -> bool {
     if lowercase_filter.is_empty() || process.name.to_lowercase().contains(lowercase_filter) {
         return true;
@@ -343,7 +424,7 @@ mod tests {
 
     use super::{App, SortColumn, SortDirection, SortSpec};
     use crate::model::{CommandLine, Metric, ProcessSnapshot, Snapshot, SystemSnapshot};
-    use crossterm::event::KeyCode;
+    use crossterm::event::{KeyCode, KeyModifiers};
 
     fn process(
         pid: u32,
@@ -610,5 +691,122 @@ mod tests {
         app.set_command_line_viewport_cells(6);
 
         assert_eq!(app.command_line_offset_cells(), 0);
+    }
+
+    #[test]
+    fn sort_shortcuts_cycle_columns_with_their_default_directions() {
+        let mut app = App::new();
+
+        app.handle_key(KeyCode::Char('s'));
+        assert_eq!(
+            app.sort(),
+            SortSpec {
+                column: SortColumn::Name,
+                direction: SortDirection::Ascending,
+            }
+        );
+
+        app.handle_key(KeyCode::Char('s'));
+        assert_eq!(
+            app.sort(),
+            SortSpec {
+                column: SortColumn::CpuPercent,
+                direction: SortDirection::Descending,
+            }
+        );
+
+        app.handle_key(KeyCode::Char('s'));
+        assert_eq!(
+            app.sort(),
+            SortSpec {
+                column: SortColumn::Memory,
+                direction: SortDirection::Descending,
+            }
+        );
+
+        app.handle_key(KeyCode::Char('s'));
+        assert_eq!(
+            app.sort(),
+            SortSpec {
+                column: SortColumn::Pid,
+                direction: SortDirection::Ascending,
+            }
+        );
+    }
+
+    #[test]
+    fn uppercase_s_reverses_the_active_sort_direction() {
+        let mut app = App::new();
+        app.handle_key(KeyCode::Char('s'));
+        app.handle_key(KeyCode::Char('S'));
+
+        assert_eq!(
+            app.sort(),
+            SortSpec {
+                column: SortColumn::Name,
+                direction: SortDirection::Descending,
+            }
+        );
+    }
+
+    #[test]
+    fn filter_edits_apply_immediately_and_can_be_accepted_or_cancelled() {
+        let mut app = App::new();
+        app.set_snapshot(snapshot(vec![
+            process(1, "alpha.exe", CommandLine::NotRequested, 0.0),
+            process(
+                2,
+                "worker.exe",
+                CommandLine::Present("worker.exe --http-port 8080".into()),
+                0.0,
+            ),
+        ]));
+
+        app.handle_key(KeyCode::Char('/'));
+        assert!(app.is_filter_editing());
+        for character in "http".chars() {
+            app.handle_key(KeyCode::Char(character));
+        }
+        assert_eq!(app.filter(), "http");
+        assert_eq!(app.visible_processes()[0].pid, 2);
+
+        app.handle_key(KeyCode::Enter);
+        assert!(!app.is_filter_editing());
+
+        app.handle_key(KeyCode::Char('/'));
+        app.handle_key(KeyCode::Char('x'));
+        assert!(app.visible_processes().is_empty());
+        app.handle_key(KeyCode::Esc);
+
+        assert!(!app.is_filter_editing());
+        assert_eq!(app.filter(), "http");
+        assert_eq!(app.visible_processes()[0].pid, 2);
+        assert!(!app.should_quit());
+    }
+
+    #[test]
+    fn control_u_clears_a_filter_while_editing() {
+        let mut app = App::new();
+        app.set_filter("worker");
+        app.handle_key(KeyCode::Char('/'));
+        app.handle_key_with_modifiers(KeyCode::Char('u'), KeyModifiers::CONTROL);
+
+        assert!(app.is_filter_editing());
+        assert_eq!(app.filter(), "");
+    }
+
+    #[test]
+    fn filter_matching_handles_unicode_case() {
+        let mut app = App::new();
+        app.set_snapshot(snapshot(vec![process(
+            1,
+            "FÖÖ.exe",
+            CommandLine::NotRequested,
+            0.0,
+        )]));
+
+        app.set_filter("föö");
+
+        assert_eq!(app.visible_processes()[0].pid, 1);
     }
 }

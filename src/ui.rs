@@ -6,7 +6,7 @@ use ratatui::{
 };
 
 use crate::{
-    app::App,
+    app::{App, SortColumn, SortDirection},
     model::{Freshness, Metric, ProcessSnapshot, Snapshot, SystemSnapshot},
     text::scroll_text,
 };
@@ -79,17 +79,19 @@ pub fn render(frame: &mut Frame, app: &App) {
                 .add_modifier(Modifier::BOLD),
         ),
     )
-    .block(Block::default().borders(Borders::ALL).title(" Processes "));
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(process_table_title(app)),
+    );
     let mut table_state = TableState::default();
     table_state.select(app.selected_viewport_index());
     frame.render_stateful_widget(table, sections[1], &mut table_state);
 
-    let footer = Paragraph::new(footer_text(
-        app.snapshot().map(|snapshot| snapshot.as_ref()),
-    ))
-    .alignment(Alignment::Center)
-    .wrap(Wrap { trim: true })
-    .block(Block::default().borders(Borders::ALL));
+    let footer = Paragraph::new(footer_text(app))
+        .alignment(Alignment::Center)
+        .wrap(Wrap { trim: true })
+        .block(Block::default().borders(Borders::ALL));
     frame.render_widget(footer, sections[2]);
 }
 
@@ -169,11 +171,60 @@ fn process_row(
     ])
 }
 
-fn footer_text(snapshot: Option<&Snapshot>) -> &'static str {
-    if snapshot.is_some_and(snapshot_is_stale) {
-        "↑↓ Move  ←→ Scroll  PgUp/PgDn  Home/End  q Quit  ~ Stale"
+fn process_table_title(app: &App) -> String {
+    let sort = app.sort();
+    let filter = if app.filter().is_empty() {
+        String::new()
     } else {
-        "↑↓ Move  ←→ Scroll  PgUp/PgDn  Home/End  q Quit"
+        format!(" / {}", app.filter())
+    };
+    format!(
+        " Processes [{}{}]{} ",
+        sort_column_label(sort.column),
+        sort_direction_indicator(sort.direction),
+        filter,
+    )
+}
+
+fn footer_text(app: &App) -> String {
+    let stale_prefix = if app
+        .snapshot()
+        .map(|snapshot| snapshot_is_stale(snapshot))
+        .unwrap_or(false)
+    {
+        "~ Stale  "
+    } else {
+        ""
+    };
+
+    if app.is_filter_editing() {
+        format!(
+            "{stale_prefix}/{}  Enter apply  Esc cancel  Ctrl+U clear",
+            app.filter()
+        )
+    } else if app.filter().is_empty() {
+        format!("{stale_prefix}s Sort  S Reverse  / Filter  q Quit")
+    } else {
+        format!(
+            "{stale_prefix}Filter: {}  s Sort  S Reverse  / Edit  q Quit",
+            app.filter()
+        )
+    }
+}
+
+fn sort_column_label(column: SortColumn) -> &'static str {
+    match column {
+        SortColumn::Pid => "PID",
+        SortColumn::Name => "Name",
+        SortColumn::CpuPercent => "CPU",
+        SortColumn::Memory => "Memory",
+    }
+}
+
+fn sort_direction_indicator(direction: SortDirection) -> char {
+    match direction {
+        SortDirection::Ascending => '↑',
+        SortDirection::Descending => '↓',
     }
 }
 
