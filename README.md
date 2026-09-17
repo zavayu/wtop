@@ -1,8 +1,6 @@
 # wtop
 
-`wtop` is an htop-style system monitor for Windows terminals. This initial
-scaffold provides a safe, full-screen terminal shell; live process and system
-data will arrive in the next milestone.
+`wtop` is an htop-style system monitor for Windows terminals
 
 ## Prerequisites
 

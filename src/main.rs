@@ -1,4 +1,5 @@
 pub mod app;
+pub mod collector;
 pub mod model;
 mod terminal;
 mod ui;
