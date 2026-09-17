@@ -11,8 +11,8 @@ use crate::model::{CommandLine, Metric, ProcessSnapshot, Snapshot, SystemSnapsho
 
 /// Collects the first-milestone process and system metrics.
 ///
-/// `Collector` intentionally contains no terminal or application state. Step
-/// three will move this synchronous collector to a background worker.
+/// `Collector` intentionally contains no terminal or application state. It is
+/// run by the background worker while the UI remains responsive.
 pub struct Collector {
     system: System,
     generation: u64,

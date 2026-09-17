@@ -8,7 +8,6 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 crossterm = "0.29.0"
-ctrlc = "3.4.7"
 ratatui = "0.30.2"
 sysinfo = "0.38.0"
 windows = { version = "0.62.2", features = ["Win32_System_ProcessStatus"] }
