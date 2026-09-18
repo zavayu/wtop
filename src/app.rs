@@ -24,6 +24,9 @@ pub struct App {
     sort: SortSpec,
     filter: String,
     filter_before_edit: Option<String>,
+    termination_confirmation: Option<TerminationTarget>,
+    termination_request: Option<TerminationTarget>,
+    status_message: Option<String>,
 }
 
 /// The supported sort keys for the first milestone's process table.
@@ -67,6 +70,13 @@ pub enum CpuDisplayMode {
     #[default]
     Summary,
     LogicalCpus,
+}
+
+/// A process explicitly selected for a termination confirmation prompt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TerminationTarget {
+    pub pid: u32,
+    pub name: String,
 }
 
 /// One rendered process row, enriched with tree-only presentation state.
@@ -178,6 +188,22 @@ impl App {
         self.filter_before_edit.is_some()
     }
 
+    pub fn termination_confirmation(&self) -> Option<&TerminationTarget> {
+        self.termination_confirmation.as_ref()
+    }
+
+    pub fn take_termination_request(&mut self) -> Option<TerminationTarget> {
+        self.termination_request.take()
+    }
+
+    pub fn status_message(&self) -> Option<&str> {
+        self.status_message.as_deref()
+    }
+
+    pub fn set_status_message(&mut self, message: impl Into<String>) {
+        self.status_message = Some(message.into());
+    }
+
     pub fn set_filter(&mut self, filter: impl Into<String>) {
         self.apply_filter(filter.into());
     }
@@ -191,6 +217,10 @@ impl App {
             self.handle_filter_key(key, modifiers);
             return;
         }
+        if self.termination_confirmation.is_some() {
+            self.handle_termination_confirmation(key);
+            return;
+        }
 
         match key {
             KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
@@ -198,6 +228,7 @@ impl App {
             KeyCode::Char('S') => self.reverse_sort_direction(),
             KeyCode::Char('t') => self.toggle_view_mode(),
             KeyCode::Char('c') => self.toggle_cpu_display_mode(),
+            KeyCode::Char('x') => self.request_termination(),
             KeyCode::Char('/') => self.begin_filter_edit(),
             KeyCode::Up => self.move_selection_by(-1),
             KeyCode::Down => self.move_selection_by(1),
@@ -217,6 +248,39 @@ impl App {
         let previous_index = self.selected_index();
         self.filter = filter;
         self.reconcile_selection(previous_index);
+    }
+
+    fn request_termination(&mut self) {
+        let Some(selected_pid) = self.selected_pid else {
+            self.set_status_message("No process is selected");
+            return;
+        };
+        let Some(process) = self
+            .visible_processes()
+            .into_iter()
+            .find(|process| process.pid == selected_pid)
+        else {
+            self.set_status_message("Selected process is no longer available");
+            return;
+        };
+
+        self.termination_confirmation = Some(TerminationTarget {
+            pid: process.pid,
+            name: process.name.clone(),
+        });
+    }
+
+    fn handle_termination_confirmation(&mut self, key: KeyCode) {
+        match key {
+            KeyCode::Char('y' | 'Y') => {
+                self.termination_request = self.termination_confirmation.take();
+            }
+            KeyCode::Char('n' | 'N') | KeyCode::Esc => {
+                self.termination_confirmation = None;
+                self.set_status_message("Termination cancelled");
+            }
+            _ => {}
+        }
     }
 
     fn begin_filter_edit(&mut self) {
@@ -783,6 +847,43 @@ mod tests {
             app.handle_key(key);
             assert!(app.should_quit());
         }
+    }
+
+    #[test]
+    fn process_termination_requires_an_explicit_confirmation() {
+        let mut app = App::new();
+        app.set_snapshot(snapshot(vec![process(
+            42,
+            "worker.exe",
+            CommandLine::NotRequested,
+            0.0,
+        )]));
+
+        app.handle_key(KeyCode::Char('x'));
+        assert_eq!(
+            app.termination_confirmation().map(|target| target.pid),
+            Some(42)
+        );
+        app.handle_key(KeyCode::Char('n'));
+        assert!(app.termination_confirmation().is_none());
+        assert!(app.take_termination_request().is_none());
+
+        app.handle_key(KeyCode::Char('x'));
+        app.handle_key(KeyCode::Char('y'));
+        let target = app
+            .take_termination_request()
+            .expect("confirmation queues a request");
+        assert_eq!(target.pid, 42);
+        assert_eq!(target.name, "worker.exe");
+    }
+
+    #[test]
+    fn termination_shortcut_without_a_selection_reports_a_status() {
+        let mut app = App::new();
+        app.handle_key(KeyCode::Char('x'));
+
+        assert_eq!(app.status_message(), Some("No process is selected"));
+        assert!(app.termination_confirmation().is_none());
     }
 
     #[test]

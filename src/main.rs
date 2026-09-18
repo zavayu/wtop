@@ -1,6 +1,7 @@
 pub mod app;
 pub mod collector;
 pub mod model;
+mod process_control;
 mod terminal;
 pub mod text;
 mod ui;
@@ -12,6 +13,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 
 use crate::{
     app::App,
+    process_control::terminate_process,
     terminal::TerminalSession,
     worker::{CollectorWorker, SnapshotStore},
 };
@@ -51,6 +53,18 @@ fn run() -> Result<(), Box<dyn Error>> {
                     }
 
                     app.handle_key_with_modifiers(key.code, key.modifiers);
+                    if let Some(target) = app.take_termination_request() {
+                        match terminate_process(target.pid) {
+                            Ok(()) => app.set_status_message(format!(
+                                "Termination requested for {} ({})",
+                                target.name, target.pid
+                            )),
+                            Err(error) => app.set_status_message(format!(
+                                "Could not terminate {} ({}): {error}",
+                                target.name, target.pid
+                            )),
+                        }
+                    }
                 }
                 // A resize event wakes the loop, and the next iteration redraws at
                 // the new terminal dimensions.

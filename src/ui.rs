@@ -3,7 +3,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Wrap},
+    widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Wrap},
 };
 
 use crate::{
@@ -98,6 +98,10 @@ pub fn render(frame: &mut Frame, app: &App) {
         .wrap(Wrap { trim: true })
         .block(Block::default().borders(Borders::ALL));
     frame.render_widget(footer, sections[2]);
+
+    if let Some(target) = app.termination_confirmation() {
+        render_termination_confirmation(frame, target.pid, &target.name);
+    }
 }
 
 fn terminal_is_too_small(width: u16, height: u16) -> bool {
@@ -143,6 +147,30 @@ fn render_minimum_size_message(frame: &mut Frame) {
         .wrap(Wrap { trim: true })
         .block(Block::default().title(" wtop ").borders(Borders::ALL));
     frame.render_widget(paragraph, frame.area());
+}
+
+fn render_termination_confirmation(frame: &mut Frame, pid: u32, name: &str) {
+    let area = frame.area();
+    let width = area.width.min(52);
+    let height = 7;
+    let dialog_area = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    let prompt = format!("Terminate {name} (PID {pid})?\n\nThis cannot be undone.  y / n");
+    let dialog = Paragraph::new(prompt)
+        .alignment(Alignment::Center)
+        .wrap(Wrap { trim: true })
+        .block(
+            Block::default()
+                .title(" Confirm process termination ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Red)),
+        );
+    frame.render_widget(Clear, dialog_area);
+    frame.render_widget(dialog, dialog_area);
 }
 
 /// Renders either aggregate CPU history or a logical-CPU grid, then the memory
@@ -472,20 +500,29 @@ fn footer_text(app: &App) -> String {
         ""
     };
 
+    let status_prefix = app
+        .status_message()
+        .map(|message| format!("{message}  "))
+        .unwrap_or_default();
+
     if app.is_filter_editing() {
         format!(
-            "{stale_prefix}/{}  Enter apply  Esc cancel  Ctrl+U clear",
+            "{stale_prefix}{status_prefix}/{}  Enter apply  Esc cancel  Ctrl+U clear",
             app.filter()
         )
     } else if app.filter().is_empty() {
         if app.view_mode() == ProcessViewMode::Tree {
-            format!("{stale_prefix}c CPU  t Flat  Enter/Space Collapse  s Sort  / Filter  q Quit")
+            format!(
+                "{stale_prefix}{status_prefix}c CPU  t Flat  Enter/Space Collapse  x Kill  s Sort  / Filter  q Quit"
+            )
         } else {
-            format!("{stale_prefix}c CPU  t Tree  s Sort  S Reverse  / Filter  q Quit")
+            format!(
+                "{stale_prefix}{status_prefix}c CPU  t Tree  x Kill  s Sort  S Reverse  / Filter  q Quit"
+            )
         }
     } else {
         format!(
-            "{stale_prefix}Filter: {}  c CPU  t View  s Sort  S Reverse  / Edit  q Quit",
+            "{stale_prefix}{status_prefix}Filter: {}  c CPU  t View  x Kill  s Sort  S Reverse  / Edit  q Quit",
             app.filter()
         )
     }

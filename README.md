@@ -1,6 +1,6 @@
 # wtop
 
-`wtop` is a read-only, htop-style system monitor for Windows terminals. It
+`wtop` is an htop-style system monitor for Windows terminals. It
 shows live CPU, memory, Windows commit, and process information in a full-screen
 terminal UI.
 
@@ -55,6 +55,7 @@ wtop
 | `c` | Toggle total CPU history and logical-CPU meters |
 | `t` | Toggle flat and tree process views |
 | `Enter` or `Space` | Expand or collapse the selected tree process |
+| `x` | Request termination of the selected process; confirm with `y`, cancel with `n` or `Esc` |
 | `s` | Cycle PID, name, user, threads, CPU, and memory sorting |
 | `S` | Reverse the active sort direction |
 | `/` | Edit a filter; it applies as you type |
@@ -89,8 +90,10 @@ source was available, and `<unknown>` means Windows supplied no owner at all.
 `Threads` is the current count from the Windows Tool Help process snapshot. If
 that snapshot cannot be read, wtop keeps the prior count and marks it stale.
 
-wtop does not alter processes. Termination, priority changes, saved views,
-custom columns, and disk/network/GPU metrics are outside this first milestone.
+wtop can request termination of a selected process only after a `y` confirmation.
+It refuses PID 0, PID 4, and itself; Windows access controls decide whether other
+processes can be terminated. Priority changes, saved views, custom columns, and
+disk/network/GPU metrics are outside this first milestone.
 
 ## Validate a build
 
@@ -115,6 +118,8 @@ PowerShell or Windows Terminal session:
   nested tree names remain readable.
 - Toggle tree mode with `t`, expand/collapse with `Enter` or `Space`, then sort
   with `s`/`S` and filter with `/`; accept, cancel, and clear a filter.
+- Select a disposable test process, press `x`, cancel with `n`, then repeat and
+  confirm with `y`; ensure protected processes report an access error.
 - Resize the terminal, including to 64 columns by 12 rows, then quit with
   `q`, `Esc`, and `Ctrl+C` to confirm terminal restoration.
 - Confirm protected processes remain visible even when command-line details are
