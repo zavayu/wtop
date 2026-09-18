@@ -7,7 +7,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::{collector::Collector, model::Snapshot};
+use crate::{
+    collector::Collector,
+    model::{History, Snapshot},
+};
 
 /// Shares the newest completed snapshot with the UI without accumulating a
 /// queue of stale refresh work.
@@ -76,7 +79,7 @@ fn collect_until_shutdown(
     let mut collector = Collector::new();
     // CPU is a delta between refreshes. Collect once to establish sysinfo's
     // timing baseline, but do not publish that unrepresentative first sample.
-    let baseline = Arc::new(collector.collect(None));
+    let baseline = cpu_sampling_baseline(&mut collector);
     let mut previous = Some(baseline);
     let mut cadence = RefreshCadence::new(refresh_interval, Instant::now());
     cadence.record_refresh_completed(Instant::now());
@@ -92,6 +95,14 @@ fn collect_until_shutdown(
             }
         }
     }
+}
+
+/// Establishes sysinfo's CPU delta baseline without allowing its unmeasured
+/// initial reading to enter the user-visible history.
+fn cpu_sampling_baseline(collector: &mut Collector) -> Arc<Snapshot> {
+    let mut baseline = collector.collect(None);
+    baseline.history = History::default();
+    Arc::new(baseline)
 }
 
 /// Schedules non-overlapping refreshes. A slow collection delays the next
@@ -126,8 +137,11 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    use super::{RefreshCadence, SnapshotStore};
-    use crate::model::{History, Metric, Snapshot, SystemSnapshot};
+    use super::{RefreshCadence, SnapshotStore, cpu_sampling_baseline};
+    use crate::{
+        collector::Collector,
+        model::{History, Metric, Snapshot, SystemSnapshot},
+    };
 
     fn snapshot(generation: u64) -> Arc<Snapshot> {
         Arc::new(Snapshot {
@@ -140,6 +154,7 @@ mod tests {
                 used_memory_bytes: Metric::fresh(0),
                 commit_charge_bytes: Metric::fresh(0),
                 commit_limit_bytes: Metric::fresh(0),
+                network: Default::default(),
             },
             processes: Metric::fresh(Vec::new()),
             history: History::default(),
@@ -179,5 +194,13 @@ mod tests {
         cadence.record_refresh_completed(started_at);
 
         assert_eq!(cadence.wait_duration(started_at), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn cpu_sampling_baseline_has_no_displayable_history() {
+        let mut collector = Collector::new();
+        let baseline = cpu_sampling_baseline(&mut collector);
+
+        assert!(baseline.history.is_empty());
     }
 }

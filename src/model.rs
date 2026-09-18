@@ -172,6 +172,38 @@ pub struct SystemSnapshot {
     pub used_memory_bytes: Metric<u64>,
     pub commit_charge_bytes: Metric<u64>,
     pub commit_limit_bytes: Metric<u64>,
+    pub network: NetworkSnapshot,
+}
+
+/// Current traffic for one Windows network interface.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NetworkInterfaceSnapshot {
+    /// Stable Windows interface LUID. It is an identity, not UI text.
+    pub id: u64,
+    pub alias: String,
+    pub operational: bool,
+    /// `None` means that no pair of counter samples is available yet.
+    pub transmit_bytes_per_second: Metric<Option<f64>>,
+    /// `None` means that no pair of counter samples is available yet.
+    pub receive_bytes_per_second: Metric<Option<f64>>,
+}
+
+/// Network counters collected independently of process data.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NetworkSnapshot {
+    pub interfaces: Metric<Vec<NetworkInterfaceSnapshot>>,
+    pub total_transmit_bytes_per_second: Metric<Option<f64>>,
+    pub total_receive_bytes_per_second: Metric<Option<f64>>,
+}
+
+impl Default for NetworkSnapshot {
+    fn default() -> Self {
+        Self {
+            interfaces: Metric::fresh(Vec::new()),
+            total_transmit_bytes_per_second: Metric::fresh(None),
+            total_receive_bytes_per_second: Metric::fresh(None),
+        }
+    }
 }
 
 /// A complete, immutable view of process, system, and header-history state from

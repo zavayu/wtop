@@ -8,11 +8,11 @@ use ratatui::{
 
 use crate::{
     app::{App, CpuDisplayMode, ProcessRow, ProcessViewMode, SortColumn, SortDirection},
-    model::{Freshness, History, HistorySample, Metric, Snapshot, SystemSnapshot},
+    model::{Freshness, History, Metric, Snapshot, SystemSnapshot},
 };
 
 const MINIMUM_WIDTH: u16 = 64;
-const MINIMUM_HEIGHT: u16 = 12;
+const MINIMUM_HEIGHT: u16 = 26;
 const PID_COLUMN_WIDTH: u16 = 7;
 const USER_COLUMN_WIDTH: u16 = 16;
 const THREADS_COLUMN_WIDTH: u16 = 8;
@@ -25,6 +25,9 @@ const COLUMN_GAP: usize = 2;
 const MIN_LOGICAL_CPU_METER_WIDTH: usize = 24;
 const LOGICAL_CPU_COLUMN_GAP: usize = 4;
 const BAR_TICK: char = '|';
+const MAX_CPU_HISTORY_ROWS: usize = 8;
+const MIN_CPU_HISTORY_ROWS: usize = 6;
+const MIN_PROCESS_ROWS: u16 = 1;
 const FOOTER_HEIGHT: u16 = 3;
 const TABLE_CHROME_HEIGHT: u16 = 3;
 
@@ -36,31 +39,42 @@ pub fn render(frame: &mut Frame, app: &App) {
         return;
     }
 
-    let header_height = header_height(area, app);
+    let cpu_height = cpu_pane_height(area, app);
+    let history_rows = cpu_history_rows(area, app);
+    let resource_height = resource_pane_height(area.width);
     let sections = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(header_height),
+            Constraint::Length(cpu_height),
+            Constraint::Length(resource_height),
             Constraint::Min(5),
             Constraint::Length(FOOTER_HEIGHT),
         ])
         .split(area);
 
     let inner_width = sections[0].width.saturating_sub(2);
-    let header = Paragraph::new(header_lines(
+    let cpu = Paragraph::new(cpu_lines(
         app.snapshot().map(|snapshot| &snapshot.system),
         app.snapshot().map(|snapshot| &snapshot.history),
         usize::from(inner_width),
         app.cpu_display_mode(),
+        history_rows,
     ))
     .alignment(Alignment::Left)
     .block(
         Block::default()
-            .title(" wtop ")
+            .title(cpu_pane_title(
+                app.snapshot().map(|snapshot| &snapshot.system),
+            ))
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Cyan)),
     );
-    frame.render_widget(header, sections[0]);
+    frame.render_widget(cpu, sections[0]);
+    render_resource_panes(
+        frame,
+        sections[1],
+        app.snapshot().map(|snapshot| &snapshot.system),
+    );
 
     let table = Table::new(
         app.viewport_process_rows()
@@ -91,13 +105,13 @@ pub fn render(frame: &mut Frame, app: &App) {
     );
     let mut table_state = TableState::default();
     table_state.select(app.selected_viewport_index());
-    frame.render_stateful_widget(table, sections[1], &mut table_state);
+    frame.render_stateful_widget(table, sections[2], &mut table_state);
 
     let footer = Paragraph::new(footer_text(app))
         .alignment(Alignment::Center)
         .wrap(Wrap { trim: true })
         .block(Block::default().borders(Borders::ALL));
-    frame.render_widget(footer, sections[2]);
+    frame.render_widget(footer, sections[3]);
 
     if let Some(target) = app.termination_confirmation() {
         render_termination_confirmation(frame, target.pid, &target.name);
@@ -118,25 +132,64 @@ pub fn process_table_row_capacity(area: Rect, app: &App) -> usize {
     } else {
         usize::from(
             area.height
-                .saturating_sub(header_height(area, app))
+                .saturating_sub(cpu_pane_height(area, app))
+                .saturating_sub(resource_pane_height(area.width))
                 .saturating_sub(FOOTER_HEIGHT + TABLE_CHROME_HEIGHT),
         )
     }
 }
 
-fn header_height(area: Rect, app: &App) -> u16 {
+fn cpu_pane_height(area: Rect, app: &App) -> u16 {
     let inner_width = usize::from(area.width.saturating_sub(2));
     let content_height = match app.cpu_display_mode() {
-        CpuDisplayMode::Summary => 3,
+        CpuDisplayMode::Summary => {
+            let history_rows = cpu_history_rows(area, app);
+            if history_rows == 0 {
+                1
+            } else {
+                history_rows + 1
+            }
+        }
         CpuDisplayMode::LogicalCpus => {
             let cpu_count = app
                 .snapshot()
                 .map(|snapshot| snapshot.system.logical_cpu_percentages.value.len())
                 .unwrap_or(0);
-            logical_cpu_grid_rows(cpu_count, inner_width).saturating_add(2)
+            logical_cpu_grid_rows(cpu_count, inner_width)
         }
     };
     u16::try_from(content_height.saturating_add(2)).unwrap_or(u16::MAX)
+}
+
+/// Uses a larger graph only when doing so leaves at least one process row.
+/// A compact summary is more useful than a tall dashboard with no table.
+fn cpu_history_rows(area: Rect, app: &App) -> usize {
+    if app.cpu_display_mode() != CpuDisplayMode::Summary {
+        return 0;
+    }
+    let reserved_height = resource_pane_height(area.width)
+        .saturating_add(FOOTER_HEIGHT)
+        .saturating_add(TABLE_CHROME_HEIGHT)
+        .saturating_add(MIN_PROCESS_ROWS)
+        .saturating_add(3); // CPU borders plus the time-axis row.
+    let available_rows = usize::from(area.height.saturating_sub(reserved_height));
+    if available_rows >= MAX_CPU_HISTORY_ROWS {
+        MAX_CPU_HISTORY_ROWS
+    } else if available_rows >= MIN_CPU_HISTORY_ROWS {
+        MIN_CPU_HISTORY_ROWS
+    } else {
+        0
+    }
+}
+
+fn resource_pane_height(width: u16) -> u16 {
+    if width >= 110 {
+        5
+    } else if width >= 80 {
+        10
+    } else {
+        12
+    }
 }
 
 fn render_minimum_size_message(frame: &mut Frame) {
@@ -173,79 +226,233 @@ fn render_termination_confirmation(frame: &mut Frame, pid: u32, name: &str) {
     frame.render_widget(dialog, dialog_area);
 }
 
-/// Renders either aggregate CPU history or a logical-CPU grid, then the memory
-/// and Windows commit bars.
-fn header_lines(
+fn cpu_pane_title(system: Option<&SystemSnapshot>) -> String {
+    let readout = system.map_or_else(
+        || "--%".into(),
+        |system| format_percent(&system.cpu_percent),
+    );
+    format!(" CPU · {readout} ")
+}
+
+/// Renders either aggregate CPU history or a logical-CPU grid.
+fn cpu_lines(
     system: Option<&SystemSnapshot>,
     history: Option<&History>,
     inner_width: usize,
     cpu_display_mode: CpuDisplayMode,
+    history_rows: usize,
 ) -> Vec<Line<'static>> {
     let Some(system) = system else {
-        return vec![
-            Line::from(if cpu_display_mode == CpuDisplayMode::Summary {
-                "CPU     --%"
+        return if cpu_display_mode == CpuDisplayMode::Summary {
+            if history_rows == 0 {
+                vec![Line::from("Collecting CPU history…")]
             } else {
-                "Logical CPUs  --"
-            }),
-            Line::from("Memory  -- / --"),
-            Line::from("Commit  -- / --"),
-        ];
+                let mut lines = vec![Line::from("Collecting CPU history…")];
+                lines.resize(history_rows + 1, Line::default());
+                lines
+            }
+        } else {
+            vec![Line::from("Logical CPUs  --")]
+        };
     };
 
-    let memory_readout = resource_readout(&system.used_memory_bytes, &system.total_memory_bytes);
-    let commit_readout = resource_readout(&system.commit_charge_bytes, &system.commit_limit_bytes);
-    let value_width = match cpu_display_mode {
-        CpuDisplayMode::Summary => [
-            display_width(&format_percent(&system.cpu_percent)),
-            display_width(&memory_readout),
-            display_width(&commit_readout),
-        ]
-        .into_iter()
-        .max()
-        .unwrap_or(0),
-        CpuDisplayMode::LogicalCpus => [
-            display_width(&memory_readout),
-            display_width(&commit_readout),
-        ]
-        .into_iter()
-        .max()
-        .unwrap_or(0),
-    };
-    let chart_cells = chart_cell_budget(inner_width, value_width);
-
-    let mut lines = match cpu_display_mode {
+    match cpu_display_mode {
+        CpuDisplayMode::Summary if history_rows > 0 => {
+            cpu_history_lines(history, inner_width, history_rows)
+        }
         CpuDisplayMode::Summary => vec![resource_line(
             "CPU",
             &format_percent(&system.cpu_percent),
-            value_width,
-            sparkline(history, chart_cells),
+            display_width(&format_percent(&system.cpu_percent)),
+            Vec::new(),
         )],
         CpuDisplayMode::LogicalCpus => {
             logical_cpu_lines(&system.logical_cpu_percentages.value, inner_width)
         }
-    };
-    lines.extend([
-        resource_line(
-            "Memory",
-            &memory_readout,
-            value_width,
-            bar(
-                percentage(&system.used_memory_bytes, &system.total_memory_bytes),
-                chart_cells,
-            ),
-        ),
-        resource_line(
-            "Commit",
-            &commit_readout,
-            value_width,
-            bar(
-                percentage(&system.commit_charge_bytes, &system.commit_limit_bytes),
-                chart_cells,
-            ),
-        ),
-    ]);
+    }
+}
+
+fn cpu_history_lines(history: Option<&History>, width: usize, height: usize) -> Vec<Line<'static>> {
+    let samples = history
+        .map(|history| history.samples().copied().collect::<Vec<_>>())
+        .unwrap_or_default();
+    let mut lines = (1..=height)
+        .rev()
+        .map(|level| {
+            let mut spans = Vec::with_capacity(width);
+            spans.extend((0..width).map(|column| {
+                let sample = samples.get(column * samples.len() / width.max(1));
+                let Some(sample) = sample else {
+                    return Span::raw(" ");
+                };
+                let filled_rows = ((sample.cpu_percent.clamp(0.0, 100.0) / 100.0) * height as f32)
+                    .round() as usize;
+                if filled_rows >= level {
+                    Span::styled(
+                        BAR_TICK.to_string(),
+                        Style::default().fg(usage_color(f64::from(sample.cpu_percent) / 100.0)),
+                    )
+                } else {
+                    Span::raw(" ")
+                }
+            }));
+            Line::from(spans)
+        })
+        .collect::<Vec<_>>();
+    lines.push(Line::from(vec![
+        Span::styled("60s ago", Style::default().fg(Color::DarkGray)),
+        Span::raw(" ".repeat(width.saturating_sub(10))),
+        Span::styled("now", Style::default().fg(Color::DarkGray)),
+    ]));
     lines
+}
+
+fn render_resource_panes(frame: &mut Frame, area: Rect, system: Option<&SystemSnapshot>) {
+    let panes = if area.width >= 110 {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(33),
+                Constraint::Percentage(34),
+                Constraint::Percentage(33),
+            ])
+            .split(area)
+            .to_vec()
+    } else if area.width >= 80 {
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(5), Constraint::Length(5)])
+            .split(area);
+        let top = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(rows[0]);
+        vec![top[0], top[1], rows[1]]
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(4),
+                Constraint::Length(4),
+                Constraint::Length(4),
+            ])
+            .split(area)
+            .to_vec()
+    };
+    render_memory_pane(frame, panes[0], system);
+    render_gpu_pane(frame, panes[1]);
+    render_network_pane(frame, panes[2], system);
+}
+
+fn render_memory_pane(frame: &mut Frame, area: Rect, system: Option<&SystemSnapshot>) {
+    let lines = system.map_or_else(
+        || vec![Line::from("RAM     -- / --"), Line::from("Commit  -- / --")],
+        |system| {
+            let ram = resource_readout(&system.used_memory_bytes, &system.total_memory_bytes);
+            let commit = resource_readout(&system.commit_charge_bytes, &system.commit_limit_bytes);
+            let value_width = display_width(&ram).max(display_width(&commit));
+            let chart_width =
+                chart_cell_budget(usize::from(area.width.saturating_sub(2)), value_width);
+            vec![
+                resource_line(
+                    "RAM",
+                    &ram,
+                    value_width,
+                    bar(
+                        percentage(&system.used_memory_bytes, &system.total_memory_bytes),
+                        chart_width,
+                    ),
+                ),
+                resource_line(
+                    "Commit",
+                    &commit,
+                    value_width,
+                    bar(
+                        percentage(&system.commit_charge_bytes, &system.commit_limit_bytes),
+                        chart_width,
+                    ),
+                ),
+            ]
+        },
+    );
+    frame.render_widget(resource_block(" Memory ", lines), area);
+}
+
+fn render_gpu_pane(frame: &mut Frame, area: Rect) {
+    // GPU counters are intentionally not represented as zero until a
+    // hardware-independent Windows source is in place and validated.
+    frame.render_widget(
+        resource_block(
+            " GPU ",
+            vec![
+                Line::from("GPU monitoring unavailable"),
+                Line::from("Windows counter support pending"),
+            ],
+        ),
+        area,
+    );
+}
+
+fn render_network_pane(frame: &mut Frame, area: Rect, system: Option<&SystemSnapshot>) {
+    let Some(system) = system else {
+        frame.render_widget(
+            resource_block(
+                " Network ",
+                vec![Line::from("Collecting interface counters…")],
+            ),
+            area,
+        );
+        return;
+    };
+
+    let network = &system.network;
+    let mut lines = vec![network_line(
+        "Total",
+        &network.total_transmit_bytes_per_second,
+        &network.total_receive_bytes_per_second,
+    )];
+    let available_rows = usize::from(area.height.saturating_sub(3));
+    lines.extend(
+        network
+            .interfaces
+            .value
+            .iter()
+            .take(available_rows.saturating_sub(1))
+            .map(|interface| {
+                network_line(
+                    &interface.alias,
+                    &interface.transmit_bytes_per_second,
+                    &interface.receive_bytes_per_second,
+                )
+            }),
+    );
+    if network.interfaces.value.is_empty() {
+        lines.push(Line::from("No operational interfaces"));
+    }
+    frame.render_widget(resource_block(" Network ", lines), area);
+}
+
+fn resource_block(title: &'static str, lines: Vec<Line<'static>>) -> Paragraph<'static> {
+    Paragraph::new(lines)
+        .block(
+            Block::default()
+                .title(title)
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::DarkGray)),
+        )
+        .wrap(Wrap { trim: true })
+}
+
+fn network_line(
+    alias: &str,
+    transmit: &Metric<Option<f64>>,
+    receive: &Metric<Option<f64>>,
+) -> Line<'static> {
+    Line::from(format!(
+        "{alias:<12.12} ↑ {:>9}  ↓ {:>9}",
+        format_rate(transmit),
+        format_rate(receive),
+    ))
 }
 
 fn logical_cpu_grid_rows(cpu_count: usize, inner_width: usize) -> usize {
@@ -357,19 +564,6 @@ fn resource_line(
     Line::from(spans)
 }
 
-fn sparkline(history: Option<&History>, width: usize) -> Vec<Span<'static>> {
-    if width < MIN_BAR_CELLS as usize {
-        return Vec::new();
-    }
-    let samples = history
-        .map(|history| history.samples().copied().collect::<Vec<_>>())
-        .unwrap_or_default();
-    vec![Span::styled(
-        render_sparkline(&samples, width),
-        Style::default().fg(Color::Cyan),
-    )]
-}
-
 fn bar(fraction: f64, width: usize) -> Vec<Span<'static>> {
     if width < MIN_BAR_CELLS as usize {
         return Vec::new();
@@ -410,27 +604,6 @@ fn percentage(used: &Metric<u64>, total: &Metric<u64>) -> f64 {
     }
 }
 
-/// Renders a right-aligned CPU sparkline. The newest sample pins to the right
-/// edge, older samples appear to its left, and a history shorter than the
-/// budget is padded on the left.
-fn render_sparkline(samples: &[HistorySample], width: usize) -> String {
-    if width == 0 {
-        return String::new();
-    }
-
-    const SPARKLINE_LEVELS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-    let taken = samples.len().min(width);
-    let mut rendered = String::with_capacity(width);
-    rendered.push_str(&" ".repeat(width.saturating_sub(taken)));
-    for sample in samples.iter().skip(samples.len() - taken) {
-        let level = ((sample.cpu_percent.clamp(0.0, 100.0) / 100.0)
-            * (SPARKLINE_LEVELS.len() - 1) as f32)
-            .round() as usize;
-        rendered.push(SPARKLINE_LEVELS[level]);
-    }
-    rendered
-}
-
 fn process_row(row: &ProcessRow<'_>, view_mode: ProcessViewMode) -> Row<'static> {
     let process = row.process;
     Row::new(vec![
@@ -451,12 +624,7 @@ fn process_name(row: &ProcessRow<'_>, view_mode: ProcessViewMode) -> String {
     // Top-level processes have no parent relationship to draw. Starting their
     // names directly preserves space for the hierarchy that follows.
     if row.ancestor_has_next_siblings.is_empty() {
-        return if row.has_children {
-            let marker = if row.is_expanded { "▾ " } else { "▸ " };
-            format!("{marker}{}", row.process.name)
-        } else {
-            row.process.name.clone()
-        };
+        return row.process.name.clone();
     }
 
     let ancestor_guides = row
@@ -465,12 +633,7 @@ fn process_name(row: &ProcessRow<'_>, view_mode: ProcessViewMode) -> String {
         .map(|has_next_sibling| if *has_next_sibling { "│   " } else { "    " })
         .collect::<String>();
     let branch = if row.is_last_sibling { '└' } else { '├' };
-    let marker = if row.has_children {
-        if row.is_expanded { "▾ " } else { "▸ " }
-    } else {
-        "─ "
-    };
-    format!("{ancestor_guides}{branch}─{marker}{}", row.process.name)
+    format!("{ancestor_guides}{branch}── {}", row.process.name)
 }
 
 fn process_table_title(app: &App) -> String {
@@ -512,9 +675,7 @@ fn footer_text(app: &App) -> String {
         )
     } else if app.filter().is_empty() {
         if app.view_mode() == ProcessViewMode::Tree {
-            format!(
-                "{stale_prefix}{status_prefix}c CPU  t Flat  Enter/Space Collapse  x Kill  s Sort  / Filter  q Quit"
-            )
+            format!("{stale_prefix}{status_prefix}c CPU  t Flat  x Kill  s Sort  / Filter  q Quit")
         } else {
             format!(
                 "{stale_prefix}{status_prefix}c CPU  t Tree  x Kill  s Sort  S Reverse  / Filter  q Quit"
@@ -560,6 +721,19 @@ fn snapshot_is_stale(snapshot: &Snapshot) -> bool {
         || metric_is_stale(&snapshot.system.used_memory_bytes)
         || metric_is_stale(&snapshot.system.commit_charge_bytes)
         || metric_is_stale(&snapshot.system.commit_limit_bytes)
+        || metric_is_stale(&snapshot.system.network.interfaces)
+        || metric_is_stale(&snapshot.system.network.total_transmit_bytes_per_second)
+        || metric_is_stale(&snapshot.system.network.total_receive_bytes_per_second)
+        || snapshot
+            .system
+            .network
+            .interfaces
+            .value
+            .iter()
+            .any(|interface| {
+                metric_is_stale(&interface.transmit_bytes_per_second)
+                    || metric_is_stale(&interface.receive_bytes_per_second)
+            })
         || metric_is_stale(&snapshot.processes)
         || snapshot
             .processes
@@ -613,16 +787,26 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
+fn format_rate(metric: &Metric<Option<f64>>) -> String {
+    let marker = freshness_marker(metric);
+    let Some(rate) = metric.value.filter(|rate| rate.is_finite() && *rate >= 0.0) else {
+        return format!("{marker}—");
+    };
+    format!("{marker}{}/s", format_bytes(rate.round() as u64))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        MINIMUM_HEIGHT, MINIMUM_WIDTH, bar, chart_cell_budget, format_bytes, format_percent,
-        header_lines, logical_cpu_grid_rows, logical_cpu_lines, percentage, process_name,
-        process_table_row_capacity, render_sparkline, resource_readout, terminal_is_too_small,
+        MINIMUM_HEIGHT, MINIMUM_WIDTH, bar, chart_cell_budget, cpu_history_lines, cpu_history_rows,
+        cpu_lines, format_bytes, format_percent, logical_cpu_grid_rows, logical_cpu_lines,
+        percentage, process_name, process_table_row_capacity, resource_readout,
+        terminal_is_too_small,
     };
     use crate::app::{App, CpuDisplayMode, ProcessRow, ProcessViewMode};
     use crate::model::{
-        CommandLine, Freshness, HistorySample, Metric, ProcessSnapshot, SystemSnapshot, UserSource,
+        CommandLine, Freshness, History, HistorySample, Metric, NetworkSnapshot, ProcessSnapshot,
+        SystemSnapshot, UserSource,
     };
     use ratatui::layout::Rect;
     use ratatui::style::Color;
@@ -655,26 +839,43 @@ mod tests {
 
     #[test]
     fn table_capacity_excludes_dashboard_and_table_chrome() {
-        let app = App::new();
-        assert_eq!(process_table_row_capacity(Rect::new(0, 0, 64, 12), &app), 1);
-        assert_eq!(process_table_row_capacity(Rect::new(0, 0, 64, 11), &app), 0);
-        assert_eq!(
-            process_table_row_capacity(Rect::new(0, 0, 64, 24), &app),
-            13
-        );
-        assert_eq!(process_table_row_capacity(Rect::new(0, 0, 63, 24), &app), 0);
+        let mut app = App::new();
+        app.toggle_cpu_display_mode();
+        assert_eq!(process_table_row_capacity(Rect::new(0, 0, 64, 26), &app), 5);
+        assert_eq!(process_table_row_capacity(Rect::new(0, 0, 64, 25), &app), 0);
+        assert_eq!(process_table_row_capacity(Rect::new(0, 0, 64, 28), &app), 1);
+        assert_eq!(process_table_row_capacity(Rect::new(0, 0, 63, 28), &app), 0);
     }
 
     #[test]
-    fn sparkline_is_right_aligned_and_drops_the_oldest_samples() {
-        let samples = vec![
-            history_sample(1.0),
-            history_sample(50.0),
-            history_sample(100.0),
-        ];
-        assert_eq!(render_sparkline(&samples, 5), "  ▁▅█");
-        assert_eq!(render_sparkline(&samples, 2), "▅█");
-        assert_eq!(render_sparkline(&samples, 0), "");
+    fn cpu_history_grows_only_when_the_process_table_keeps_a_row() {
+        let mut app = App::new();
+        app.toggle_cpu_display_mode();
+        assert_eq!(cpu_history_rows(Rect::new(0, 0, 64, 26), &app), 0);
+        assert_eq!(cpu_history_rows(Rect::new(0, 0, 64, 28), &app), 6);
+        assert_eq!(cpu_history_rows(Rect::new(0, 0, 64, 30), &app), 8);
+    }
+
+    #[test]
+    fn cpu_history_stretches_tick_columns_across_the_available_width() {
+        let mut history = History::with_capacity(3);
+        history.push(history_sample(25.0));
+        history.push(history_sample(50.0));
+        history.push(history_sample(100.0));
+        let lines = cpu_history_lines(Some(&history), 5, 4);
+        assert_eq!(lines.len(), 5);
+        let top_row = lines[0]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert_eq!(top_row, "    |");
+        let bottom_row = lines[3]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert_eq!(bottom_row, "|||||");
     }
 
     #[test]
@@ -737,15 +938,17 @@ mod tests {
             used_memory_bytes: Metric::stale(u64::MAX, "query failed"),
             commit_charge_bytes: Metric::stale(u64::MAX, "query failed"),
             commit_limit_bytes: Metric::fresh(u64::MAX),
+            network: NetworkSnapshot::default(),
         };
 
-        for line in header_lines(Some(&system), None, 58, CpuDisplayMode::Summary)
+        for line in cpu_lines(Some(&system), None, 58, CpuDisplayMode::Summary, 8)
             .into_iter()
-            .chain(header_lines(
+            .chain(cpu_lines(
                 Some(&system),
                 None,
                 58,
                 CpuDisplayMode::LogicalCpus,
+                0,
             ))
         {
             let width = line
@@ -753,7 +956,7 @@ mod tests {
                 .iter()
                 .map(|span| span.content.chars().count())
                 .sum::<usize>();
-            assert!(width <= 58, "header line was {width} cells wide");
+            assert!(width <= 58, "header line was {width} cells wide: {line:?}");
         }
     }
 
@@ -780,17 +983,15 @@ mod tests {
             ancestor_has_next_siblings: Vec::new(),
             is_last_sibling: false,
             has_children: true,
-            is_expanded: true,
         };
         let leaf = ProcessRow {
             process: &process,
             ancestor_has_next_siblings: vec![true, false],
             is_last_sibling: true,
             has_children: false,
-            is_expanded: false,
         };
 
-        assert_eq!(process_name(&branch, ProcessViewMode::Tree), "▾ worker.exe");
+        assert_eq!(process_name(&branch, ProcessViewMode::Tree), "worker.exe");
         assert_eq!(
             process_name(&leaf, ProcessViewMode::Tree),
             "│       └── worker.exe"

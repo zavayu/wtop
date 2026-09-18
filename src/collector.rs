@@ -8,6 +8,10 @@ use sysinfo::{Process, ProcessRefreshKind, ProcessesToUpdate, System, Uid, Updat
 use windows::{
     Win32::{
         Foundation::{CloseHandle, ERROR_NO_MORE_FILES},
+        NetworkManagement::{
+            IpHelper::{FreeMibTable, GetIfTable2, MIB_IF_TABLE2},
+            Ndis::NET_IF_OPER_STATUS_UP,
+        },
         System::{
             Diagnostics::ToolHelp::{
                 CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
@@ -26,7 +30,8 @@ use windows::{
 };
 
 use crate::model::{
-    CommandLine, HistorySample, Metric, ProcessSnapshot, Snapshot, SystemSnapshot, UserSource,
+    CommandLine, HistorySample, Metric, NetworkInterfaceSnapshot, NetworkSnapshot, ProcessSnapshot,
+    Snapshot, SystemSnapshot, UserSource,
 };
 
 /// Collects the first-milestone process and system metrics.
@@ -39,6 +44,14 @@ pub struct Collector {
     command_lines: HashMap<ProcessIdentity, CommandLine>,
     users: HashMap<Uid, String>,
     service_accounts: HashMap<String, Option<String>>,
+    network_baselines: HashMap<u64, NetworkCounterBaseline>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct NetworkCounterBaseline {
+    received_bytes: u64,
+    transmitted_bytes: u64,
+    sampled_at: Instant,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -65,6 +78,7 @@ impl Collector {
                 .map(|user| (user.id().clone(), user.name().to_owned()))
                 .collect(),
             service_accounts: HashMap::new(),
+            network_baselines: HashMap::new(),
         }
     }
 
@@ -115,6 +129,7 @@ impl Collector {
                 ),
             ),
         };
+        let network = self.collect_network(previous);
 
         let cpu_percent = self.system.global_cpu_usage();
         let logical_cpu_percentages = self
@@ -141,9 +156,92 @@ impl Collector {
                 used_memory_bytes: Metric::fresh(used_memory_bytes),
                 commit_charge_bytes,
                 commit_limit_bytes,
+                network,
             },
             processes,
             history,
+        }
+    }
+
+    fn collect_network(&mut self, previous: Option<&Snapshot>) -> NetworkSnapshot {
+        let sampled_at = Instant::now();
+        let rows = match network_interfaces() {
+            Ok(rows) => rows,
+            Err(reason) => {
+                return previous.map_or_else(
+                    || NetworkSnapshot {
+                        interfaces: Metric::stale(Vec::new(), reason.clone()),
+                        total_transmit_bytes_per_second: Metric::stale(None, reason.clone()),
+                        total_receive_bytes_per_second: Metric::stale(None, &reason),
+                    },
+                    |snapshot| stale_network_snapshot(&snapshot.system.network, &reason),
+                );
+            }
+        };
+
+        let mut live_interfaces = HashSet::new();
+        let mut total_transmit = Some(0.0);
+        let mut total_receive = Some(0.0);
+        let mut interfaces = rows
+            .into_iter()
+            .map(|row| {
+                live_interfaces.insert(row.id);
+                let previous = self.network_baselines.insert(
+                    row.id,
+                    NetworkCounterBaseline {
+                        received_bytes: row.received_bytes,
+                        transmitted_bytes: row.transmitted_bytes,
+                        sampled_at,
+                    },
+                );
+                let transmit = previous.and_then(|baseline| {
+                    counter_rate(
+                        baseline.transmitted_bytes,
+                        row.transmitted_bytes,
+                        baseline.sampled_at,
+                        sampled_at,
+                    )
+                });
+                let receive = previous.and_then(|baseline| {
+                    counter_rate(
+                        baseline.received_bytes,
+                        row.received_bytes,
+                        baseline.sampled_at,
+                        sampled_at,
+                    )
+                });
+                if row.operational {
+                    total_transmit = total_transmit
+                        .zip(transmit)
+                        .map(|(total, rate)| total + rate);
+                    total_receive = total_receive.zip(receive).map(|(total, rate)| total + rate);
+                }
+                NetworkInterfaceSnapshot {
+                    id: row.id,
+                    alias: row.alias,
+                    operational: row.operational,
+                    transmit_bytes_per_second: Metric::fresh(transmit),
+                    receive_bytes_per_second: Metric::fresh(receive),
+                }
+            })
+            .filter(|interface| interface.operational)
+            .collect::<Vec<_>>();
+        self.network_baselines
+            .retain(|id, _| live_interfaces.contains(id));
+        interfaces.sort_by(|left, right| {
+            let left_rate = left.transmit_bytes_per_second.value.unwrap_or_default()
+                + left.receive_bytes_per_second.value.unwrap_or_default();
+            let right_rate = right.transmit_bytes_per_second.value.unwrap_or_default()
+                + right.receive_bytes_per_second.value.unwrap_or_default();
+            right_rate
+                .total_cmp(&left_rate)
+                .then_with(|| left.alias.cmp(&right.alias))
+        });
+
+        NetworkSnapshot {
+            interfaces: Metric::fresh(interfaces),
+            total_transmit_bytes_per_second: Metric::fresh(total_transmit),
+            total_receive_bytes_per_second: Metric::fresh(total_receive),
         }
     }
 
@@ -314,6 +412,84 @@ fn cached_command_line(
 fn stale_metric(previous: Option<&Metric<u64>>, reason: &str) -> Metric<u64> {
     let value = previous.map_or(0, |metric| metric.value);
     Metric::stale(value, reason)
+}
+
+#[derive(Clone, Debug)]
+struct NetworkInterfaceCounters {
+    id: u64,
+    alias: String,
+    operational: bool,
+    received_bytes: u64,
+    transmitted_bytes: u64,
+}
+
+/// Returns counters for every Windows network interface. The returned table is
+/// copied before its Windows-owned allocation is freed.
+fn network_interfaces() -> Result<Vec<NetworkInterfaceCounters>, String> {
+    let mut table = std::ptr::null_mut::<MIB_IF_TABLE2>();
+    let result = unsafe { GetIfTable2(&mut table) };
+    if !result.is_ok() {
+        return Err(format!("GetIfTable2 failed: {result:?}"));
+    }
+    if table.is_null() {
+        return Err("GetIfTable2 returned no table".into());
+    }
+
+    let rows = unsafe {
+        let entries = usize::try_from((*table).NumEntries).unwrap_or(0);
+        let rows = std::slice::from_raw_parts((*table).Table.as_ptr(), entries);
+        rows.iter()
+            .map(|row| NetworkInterfaceCounters {
+                id: row.InterfaceLuid.Value,
+                alias: wide_c_string(&row.Alias),
+                operational: row.OperStatus.0 == NET_IF_OPER_STATUS_UP.0,
+                received_bytes: row.InOctets,
+                transmitted_bytes: row.OutOctets,
+            })
+            .collect::<Vec<_>>()
+    };
+    unsafe { FreeMibTable(table.cast()) };
+    Ok(rows)
+}
+
+fn wide_c_string(value: &[u16]) -> String {
+    let length = value
+        .iter()
+        .position(|character| *character == 0)
+        .unwrap_or(value.len());
+    String::from_utf16_lossy(&value[..length])
+}
+
+fn counter_rate(
+    previous: u64,
+    current: u64,
+    previous_at: Instant,
+    sampled_at: Instant,
+) -> Option<f64> {
+    let elapsed = sampled_at
+        .saturating_duration_since(previous_at)
+        .as_secs_f64();
+    (elapsed > 0.0)
+        .then(|| {
+            current
+                .checked_sub(previous)
+                .map(|delta| delta as f64 / elapsed)
+        })
+        .flatten()
+}
+
+fn stale_network_snapshot(previous: &NetworkSnapshot, reason: &str) -> NetworkSnapshot {
+    NetworkSnapshot {
+        interfaces: Metric::stale(previous.interfaces.value.clone(), reason),
+        total_transmit_bytes_per_second: Metric::stale(
+            previous.total_transmit_bytes_per_second.value,
+            reason,
+        ),
+        total_receive_bytes_per_second: Metric::stale(
+            previous.total_receive_bytes_per_second.value,
+            reason,
+        ),
+    }
 }
 
 /// Returns concise names for Windows service accounts whose SIDs are stable
@@ -536,11 +712,12 @@ fn pages_to_bytes(pages: usize, page_size: usize) -> Result<u64, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Collector, command_line_from_arguments, normalize_process_cpu_percent,
+        Collector, command_line_from_arguments, counter_rate, normalize_process_cpu_percent,
         normalize_service_account, normalize_system_cpu_percent, pages_to_bytes, stale_metric,
         well_known_windows_user,
     };
     use crate::model::{CommandLine, Freshness, Metric};
+    use std::time::{Duration, Instant};
 
     #[test]
     fn command_line_mapping_preserves_unavailable_state() {
@@ -554,6 +731,25 @@ mod tests {
     #[test]
     fn commit_pages_are_converted_to_bytes_without_rounding() {
         assert_eq!(pages_to_bytes(1_024, 4_096), Ok(4_194_304));
+    }
+
+    #[test]
+    fn network_rates_use_the_actual_elapsed_time_and_reject_counter_resets() {
+        let started_at = Instant::now();
+        assert_eq!(
+            counter_rate(
+                100,
+                1_100,
+                started_at,
+                started_at + Duration::from_millis(250)
+            ),
+            Some(4_000.0)
+        );
+        assert_eq!(
+            counter_rate(1_100, 100, started_at, started_at + Duration::from_secs(1)),
+            None
+        );
+        assert_eq!(counter_rate(100, 200, started_at, started_at), None);
     }
 
     #[test]

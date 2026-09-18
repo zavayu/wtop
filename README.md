@@ -1,24 +1,24 @@
 # wtop
 
 `wtop` is an htop-style system monitor for Windows terminals. It
-shows live CPU, memory, Windows commit, and process information in a full-screen
-terminal UI.
+shows live CPU, memory, Windows commit, network, and process information in a
+full-screen terminal UI.
 
 ## Current features
 
 - A refreshable process table with PID, user, thread count, CPU usage, memory
   use, and a flexible name column that keeps process trees readable.
-- A system header with a total-CPU history view, physical memory used/total
-  bar, and Windows commit charge/limit bar. Bars hold the last read value when
-  a query fails. CPU values appear after the first refresh interval, once a
-  sampling baseline exists.
-- Toggle from the compact total-CPU history to a responsive grid of current
-  logical-CPU meters; the header grows to accommodate the grid.
+- A responsive resource dashboard: CPU history or logical-CPU meters, memory
+  and Windows commit bars, plus network transmit/receive rates for active
+  interfaces. The network pane uses Windows interface byte counters and waits
+  for a second sample rather than reporting a misleading initial rate.
+- A responsive grid of current logical-CPU meters by default; press `c` to
+  switch to the total-CPU history view.
 - Selection and vertical process-list scrolling.
 - Flat and parent/child tree process views, with expandable process groups.
 - Process sorting and live case-insensitive filtering; tree filters retain the
   ancestors of matching processes for context.
-- Safe resize behavior, a 64 columns by 12 rows minimum-size message, and
+- Safe resize behavior, a 64 columns by 26 rows minimum-size message, and
   terminal restoration on exit.
 
 ## Requirements
@@ -54,7 +54,6 @@ wtop
 | `Home` / `End` | Select the first / last visible process |
 | `c` | Toggle total CPU history and logical-CPU meters |
 | `t` | Toggle flat and tree process views |
-| `Enter` or `Space` | Expand or collapse the selected tree process |
 | `x` | Request termination of the selected process; confirm with `y`, cancel with `n` or `Esc` |
 | `s` | Cycle PID, name, user, threads, CPU, and memory sorting |
 | `S` | Reverse the active sort direction |
@@ -92,8 +91,10 @@ that snapshot cannot be read, wtop keeps the prior count and marks it stale.
 
 wtop can request termination of a selected process only after a `y` confirmation.
 It refuses PID 0, PID 4, and itself; Windows access controls decide whether other
-processes can be terminated. Priority changes, saved views, custom columns, and
-disk/network/GPU metrics are outside this first milestone.
+processes can be terminated. Priority changes, saved views, custom columns,
+disk metrics, and validated GPU telemetry remain outside this milestone. The
+GPU pane intentionally reports unavailable rather than presenting unverified
+measurements as zeroes.
 
 ## Validate a build
 
@@ -116,11 +117,11 @@ PowerShell or Windows Terminal session:
   readouts.
 - Move through a process list taller than the terminal and verify that deeply
   nested tree names remain readable.
-- Toggle tree mode with `t`, expand/collapse with `Enter` or `Space`, then sort
-  with `s`/`S` and filter with `/`; accept, cancel, and clear a filter.
+- Toggle tree mode with `t`, then sort with `s`/`S` and filter with `/`; accept,
+  cancel, and clear a filter.
 - Select a disposable test process, press `x`, cancel with `n`, then repeat and
   confirm with `y`; ensure protected processes report an access error.
-- Resize the terminal, including to 64 columns by 12 rows, then quit with
+- Resize the terminal, including to 64 columns by 26 rows, then quit with
   `q`, `Esc`, and `Ctrl+C` to confirm terminal restoration.
 - Confirm protected processes remain visible even when command-line details are
   unavailable.

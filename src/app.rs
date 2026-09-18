@@ -20,7 +20,6 @@ pub struct App {
     viewport_rows: usize,
     view_mode: ProcessViewMode,
     cpu_display_mode: CpuDisplayMode,
-    collapsed_pids: HashSet<u32>,
     sort: SortSpec,
     filter: String,
     filter_before_edit: Option<String>,
@@ -67,8 +66,8 @@ pub enum ProcessViewMode {
 /// Chooses the aggregate CPU history or current logical-CPU meters in the header.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum CpuDisplayMode {
-    #[default]
     Summary,
+    #[default]
     LogicalCpus,
 }
 
@@ -89,7 +88,6 @@ pub struct ProcessRow<'a> {
     /// Whether this row is the final sibling at its level.
     pub is_last_sibling: bool,
     pub has_children: bool,
-    pub is_expanded: bool,
 }
 
 impl App {
@@ -239,7 +237,6 @@ impl App {
                 let last_index = self.visible_processes().len().saturating_sub(1);
                 self.move_selection_to(last_index);
             }
-            KeyCode::Enter | KeyCode::Char(' ') => self.toggle_selected_expansion(),
             _ => {}
         }
     }
@@ -316,13 +313,6 @@ impl App {
     /// whenever that process still exists in the new visible list.
     pub fn set_snapshot(&mut self, snapshot: Arc<Snapshot>) {
         let previous_index = self.selected_index();
-        self.collapsed_pids.retain(|pid| {
-            snapshot
-                .processes
-                .value
-                .iter()
-                .any(|process| process.pid == *pid)
-        });
         self.snapshot = Some(snapshot);
         self.reconcile_selection(previous_index);
     }
@@ -362,16 +352,10 @@ impl App {
                         ancestor_has_next_siblings: Vec::new(),
                         is_last_sibling: true,
                         has_children: false,
-                        is_expanded: false,
                     })
                     .collect()
             }
-            ProcessViewMode::Tree => tree_rows(
-                &snapshot.processes.value,
-                &filter,
-                self.sort,
-                &self.collapsed_pids,
-            ),
+            ProcessViewMode::Tree => tree_rows(&snapshot.processes.value, &filter, self.sort),
         }
     }
 
@@ -438,29 +422,6 @@ impl App {
             }
             self.ensure_selected_row_is_visible();
         }
-    }
-
-    fn toggle_selected_expansion(&mut self) {
-        if self.view_mode != ProcessViewMode::Tree {
-            return;
-        }
-
-        let Some(selected_pid) = self.selected_pid else {
-            return;
-        };
-        let has_children = self
-            .visible_rows()
-            .into_iter()
-            .find(|row| row.process.pid == selected_pid)
-            .is_some_and(|row| row.has_children);
-        if !has_children {
-            return;
-        }
-
-        if !self.collapsed_pids.insert(selected_pid) {
-            self.collapsed_pids.remove(&selected_pid);
-        }
-        self.ensure_selected_row_is_visible();
     }
 
     fn selected_index(&self) -> Option<usize> {
@@ -540,7 +501,6 @@ fn tree_rows<'a>(
     processes: &'a [ProcessSnapshot],
     lowercase_filter: &str,
     sort: SortSpec,
-    collapsed_pids: &HashSet<u32>,
 ) -> Vec<ProcessRow<'a>> {
     let processes_by_pid = processes
         .iter()
@@ -548,13 +508,6 @@ fn tree_rows<'a>(
         .collect::<HashMap<_, _>>();
     let included_pids = tree_filter_pids(&processes_by_pid, lowercase_filter);
     let (mut root_pids, mut child_pids) = tree_relationships(&processes_by_pid);
-    let no_collapsed_pids = HashSet::new();
-    let effective_collapsed_pids = if lowercase_filter.is_empty() {
-        collapsed_pids
-    } else {
-        &no_collapsed_pids
-    };
-
     sort_process_ids(&mut root_pids, &processes_by_pid, sort);
     for children in child_pids.values_mut() {
         sort_process_ids(children, &processes_by_pid, sort);
@@ -589,7 +542,6 @@ fn tree_rows<'a>(
             &processes_by_pid,
             &child_pids,
             &included_pids,
-            effective_collapsed_pids,
             &mut visited_pids,
             &mut rows,
         );
@@ -674,7 +626,6 @@ fn append_tree_rows<'a>(
     processes_by_pid: &HashMap<u32, &'a ProcessSnapshot>,
     child_pids: &HashMap<u32, Vec<u32>>,
     included_pids: &HashSet<u32>,
-    collapsed_pids: &HashSet<u32>,
     visited_pids: &mut HashSet<u32>,
     rows: &mut Vec<ProcessRow<'a>>,
 ) {
@@ -696,16 +647,14 @@ fn append_tree_rows<'a>(
         })
         .unwrap_or_default();
     let has_children = !visible_children.is_empty();
-    let is_expanded = has_children && !collapsed_pids.contains(&pid);
     rows.push(ProcessRow {
         process,
         ancestor_has_next_siblings: ancestor_has_next_siblings.to_vec(),
         is_last_sibling,
         has_children,
-        is_expanded,
     });
 
-    if is_expanded {
+    if has_children {
         let mut child_ancestor_has_next_siblings = ancestor_has_next_siblings.to_vec();
         child_ancestor_has_next_siblings.push(!is_last_sibling);
         let child_count = visible_children.len();
@@ -717,7 +666,6 @@ fn append_tree_rows<'a>(
                 processes_by_pid,
                 child_pids,
                 included_pids,
-                collapsed_pids,
                 visited_pids,
                 rows,
             );
@@ -834,6 +782,7 @@ mod tests {
                 used_memory_bytes: Metric::fresh(0),
                 commit_charge_bytes: Metric::fresh(0),
                 commit_limit_bytes: Metric::fresh(0),
+                network: Default::default(),
             },
             processes: Metric::fresh(processes),
             history: Default::default(),
@@ -889,13 +838,13 @@ mod tests {
     #[test]
     fn c_toggles_between_summary_and_logical_cpu_header_modes() {
         let mut app = App::new();
-        assert_eq!(app.cpu_display_mode(), CpuDisplayMode::Summary);
-
-        app.handle_key(KeyCode::Char('c'));
         assert_eq!(app.cpu_display_mode(), CpuDisplayMode::LogicalCpus);
 
         app.handle_key(KeyCode::Char('c'));
         assert_eq!(app.cpu_display_mode(), CpuDisplayMode::Summary);
+
+        app.handle_key(KeyCode::Char('c'));
+        assert_eq!(app.cpu_display_mode(), CpuDisplayMode::LogicalCpus);
     }
 
     #[test]
@@ -1305,44 +1254,6 @@ mod tests {
         app.toggle_view_mode();
         app.set_filter("worker");
 
-        assert_eq!(
-            app.visible_processes()
-                .into_iter()
-                .map(|process| process.pid)
-                .collect::<Vec<_>>(),
-            vec![1, 2]
-        );
-    }
-
-    #[test]
-    fn tree_rows_expand_and_collapse_with_the_selected_parent() {
-        let mut app = App::new();
-        app.set_snapshot(snapshot(vec![
-            process_with_parent(1, None, "root.exe"),
-            process_with_parent(2, Some(1), "child.exe"),
-        ]));
-        app.toggle_view_mode();
-
-        app.handle_key(KeyCode::Enter);
-        assert_eq!(
-            app.visible_processes()
-                .into_iter()
-                .map(|process| process.pid)
-                .collect::<Vec<_>>(),
-            vec![1]
-        );
-
-        app.set_filter("child");
-        assert_eq!(
-            app.visible_processes()
-                .into_iter()
-                .map(|process| process.pid)
-                .collect::<Vec<_>>(),
-            vec![1, 2]
-        );
-        app.set_filter("");
-
-        app.handle_key(KeyCode::Char(' '));
         assert_eq!(
             app.visible_processes()
                 .into_iter()
