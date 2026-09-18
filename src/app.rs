@@ -20,6 +20,7 @@ pub struct App {
     viewport_rows: usize,
     view_mode: ProcessViewMode,
     cpu_display_mode: CpuDisplayMode,
+    gpu_display: GpuDisplayMode,
     sort: SortSpec,
     filter: String,
     filter_before_edit: Option<String>,
@@ -69,6 +70,14 @@ pub enum CpuDisplayMode {
     Summary,
     #[default]
     LogicalCpus,
+}
+
+/// Chooses either the multi-adapter overview or a stable adapter LUID.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum GpuDisplayMode {
+    #[default]
+    Overview,
+    Adapter(u64),
 }
 
 /// A process explicitly selected for a termination confirmation prompt.
@@ -133,6 +142,38 @@ impl App {
         self.cpu_display_mode = match self.cpu_display_mode {
             CpuDisplayMode::Summary => CpuDisplayMode::LogicalCpus,
             CpuDisplayMode::LogicalCpus => CpuDisplayMode::Summary,
+        };
+    }
+
+    pub fn gpu_display_mode(&self) -> GpuDisplayMode {
+        self.gpu_display
+    }
+
+    pub fn cycle_gpu_display(&mut self) {
+        let ids = self
+            .snapshot()
+            .map(|snapshot| {
+                snapshot
+                    .system
+                    .gpu
+                    .adapters
+                    .value
+                    .iter()
+                    .map(|adapter| adapter.id)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        self.gpu_display = match self.gpu_display {
+            GpuDisplayMode::Overview => ids
+                .first()
+                .copied()
+                .map_or(GpuDisplayMode::Overview, GpuDisplayMode::Adapter),
+            GpuDisplayMode::Adapter(id) => ids
+                .iter()
+                .position(|candidate| *candidate == id)
+                .and_then(|index| ids.get(index + 1))
+                .copied()
+                .map_or(GpuDisplayMode::Overview, GpuDisplayMode::Adapter),
         };
     }
 
@@ -226,6 +267,7 @@ impl App {
             KeyCode::Char('S') => self.reverse_sort_direction(),
             KeyCode::Char('t') => self.toggle_view_mode(),
             KeyCode::Char('c') => self.toggle_cpu_display_mode(),
+            KeyCode::Char('g') => self.cycle_gpu_display(),
             KeyCode::Char('x') => self.request_termination(),
             KeyCode::Char('/') => self.begin_filter_edit(),
             KeyCode::Up => self.move_selection_by(-1),
@@ -314,6 +356,19 @@ impl App {
     pub fn set_snapshot(&mut self, snapshot: Arc<Snapshot>) {
         let previous_index = self.selected_index();
         self.snapshot = Some(snapshot);
+        if let GpuDisplayMode::Adapter(id) = self.gpu_display {
+            if !self.snapshot().is_some_and(|snapshot| {
+                snapshot
+                    .system
+                    .gpu
+                    .adapters
+                    .value
+                    .iter()
+                    .any(|adapter| adapter.id == id)
+            }) {
+                self.gpu_display = GpuDisplayMode::Overview;
+            }
+        }
         self.reconcile_selection(previous_index);
     }
 
@@ -739,9 +794,12 @@ fn process_matches_filter(process: &ProcessSnapshot, lowercase_filter: &str) -> 
 mod tests {
     use std::{sync::Arc, time::Instant};
 
-    use super::{App, CpuDisplayMode, ProcessViewMode, SortColumn, SortDirection, SortSpec};
+    use super::{
+        App, CpuDisplayMode, GpuDisplayMode, ProcessViewMode, SortColumn, SortDirection, SortSpec,
+    };
     use crate::model::{
-        CommandLine, Metric, ProcessSnapshot, Snapshot, SystemSnapshot, UserSource,
+        CommandLine, GpuAdapterSnapshot, Metric, ProcessSnapshot, Snapshot, SystemSnapshot,
+        UserSource,
     };
     use crossterm::event::{KeyCode, KeyModifiers};
 
@@ -783,10 +841,23 @@ mod tests {
                 commit_charge_bytes: Metric::fresh(0),
                 commit_limit_bytes: Metric::fresh(0),
                 network: Default::default(),
+                gpu: Default::default(),
             },
             processes: Metric::fresh(processes),
             history: Default::default(),
         })
+    }
+
+    fn gpu(id: u64, name: &str) -> GpuAdapterSnapshot {
+        GpuAdapterSnapshot {
+            id,
+            name: name.into(),
+            utilization_percent: Metric::fresh(None),
+            dedicated_memory_used_bytes: Metric::fresh(None),
+            dedicated_memory_capacity_bytes: Metric::fresh(None),
+            shared_memory_used_bytes: Metric::fresh(None),
+            shared_memory_capacity_bytes: Metric::fresh(None),
+        }
     }
 
     #[test]
@@ -796,6 +867,22 @@ mod tests {
             app.handle_key(key);
             assert!(app.should_quit());
         }
+    }
+
+    #[test]
+    fn g_cycles_gpu_overview_and_adapters_by_stable_identity() {
+        let mut app = App::new();
+        let mut fresh_snapshot = (*snapshot(Vec::new())).clone();
+        fresh_snapshot.system.gpu.adapters =
+            Metric::fresh(vec![gpu(7, "Integrated"), gpu(9, "Discrete")]);
+        app.set_snapshot(Arc::new(fresh_snapshot));
+
+        app.handle_key(KeyCode::Char('g'));
+        assert_eq!(app.gpu_display_mode(), GpuDisplayMode::Adapter(7));
+        app.handle_key(KeyCode::Char('g'));
+        assert_eq!(app.gpu_display_mode(), GpuDisplayMode::Adapter(9));
+        app.handle_key(KeyCode::Char('g'));
+        assert_eq!(app.gpu_display_mode(), GpuDisplayMode::Overview);
     }
 
     #[test]

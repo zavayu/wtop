@@ -12,6 +12,10 @@ full-screen terminal UI.
   and Windows commit bars, plus network transmit/receive rates for active
   interfaces. The network pane uses Windows interface byte counters and waits
   for a second sample rather than reporting a misleading initial rate.
+- GPU overview and adapter panes sourced from DXGI and Windows performance
+  counters. The overview lists adapters separately; `g` cycles to a detailed
+  adapter view. Unsupported driver counters remain unavailable rather than
+  appearing as zeroes.
 - A responsive grid of current logical-CPU meters by default; press `c` to
   switch to the total-CPU history view.
 - Selection and vertical process-list scrolling.
@@ -53,6 +57,7 @@ wtop
 | `Page Up` / `Page Down` | Move by one visible page |
 | `Home` / `End` | Select the first / last visible process |
 | `c` | Toggle total CPU history and logical-CPU meters |
+| `g` | Cycle GPU overview and individual GPU panes |
 | `t` | Toggle flat and tree process views |
 | `x` | Request termination of the selected process; confirm with `y`, cancel with `n` or `Esc` |
 | `s` | Cycle PID, name, user, threads, CPU, and memory sorting |
@@ -92,9 +97,9 @@ that snapshot cannot be read, wtop keeps the prior count and marks it stale.
 wtop can request termination of a selected process only after a `y` confirmation.
 It refuses PID 0, PID 4, and itself; Windows access controls decide whether other
 processes can be terminated. Priority changes, saved views, custom columns,
-disk metrics, and validated GPU telemetry remain outside this milestone. The
-GPU pane intentionally reports unavailable rather than presenting unverified
-measurements as zeroes.
+disk metrics, temperature/clocks/fans, and per-process GPU attribution remain
+outside this milestone. GPU engine and adapter-memory counters are
+driver-dependent; unavailable values are never presented as zeroes.
 
 ## Validate a build
 

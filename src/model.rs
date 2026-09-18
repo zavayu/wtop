@@ -173,6 +173,35 @@ pub struct SystemSnapshot {
     pub commit_charge_bytes: Metric<u64>,
     pub commit_limit_bytes: Metric<u64>,
     pub network: NetworkSnapshot,
+    pub gpu: GpuSnapshot,
+}
+
+/// Current telemetry for one hardware GPU adapter.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GpuAdapterSnapshot {
+    /// DXGI adapter LUID packed into a stable 64-bit identifier.
+    pub id: u64,
+    pub name: String,
+    /// Busiest active engine, not a sum of overlapping engine percentages.
+    pub utilization_percent: Metric<Option<f32>>,
+    pub dedicated_memory_used_bytes: Metric<Option<u64>>,
+    pub dedicated_memory_capacity_bytes: Metric<Option<u64>>,
+    pub shared_memory_used_bytes: Metric<Option<u64>>,
+    pub shared_memory_capacity_bytes: Metric<Option<u64>>,
+}
+
+/// Hardware GPU adapters and their capability-aware telemetry.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GpuSnapshot {
+    pub adapters: Metric<Vec<GpuAdapterSnapshot>>,
+}
+
+impl Default for GpuSnapshot {
+    fn default() -> Self {
+        Self {
+            adapters: Metric::fresh(Vec::new()),
+        }
+    }
 }
 
 /// Current traffic for one Windows network interface.

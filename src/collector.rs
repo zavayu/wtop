@@ -8,6 +8,9 @@ use sysinfo::{Process, ProcessRefreshKind, ProcessesToUpdate, System, Uid, Updat
 use windows::{
     Win32::{
         Foundation::{CloseHandle, ERROR_NO_MORE_FILES},
+        Graphics::Dxgi::{
+            CreateDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE, DXGI_ERROR_NOT_FOUND, IDXGIFactory1,
+        },
         NetworkManagement::{
             IpHelper::{FreeMibTable, GetIfTable2, MIB_IF_TABLE2},
             Ndis::NET_IF_OPER_STATUS_UP,
@@ -16,6 +19,11 @@ use windows::{
             Diagnostics::ToolHelp::{
                 CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
                 TH32CS_SNAPPROCESS,
+            },
+            Performance::{
+                PDH_CSTATUS_NEW_DATA, PDH_CSTATUS_VALID_DATA, PDH_FMT_COUNTERVALUE_ITEM_W,
+                PDH_FMT_DOUBLE, PDH_HCOUNTER, PDH_HQUERY, PDH_MORE_DATA, PdhAddEnglishCounterW,
+                PdhCloseQuery, PdhCollectQueryData, PdhGetFormattedCounterArrayW, PdhOpenQueryW,
             },
             ProcessStatus::{GetPerformanceInfo, PERFORMANCE_INFORMATION},
             Services::{
@@ -30,8 +38,8 @@ use windows::{
 };
 
 use crate::model::{
-    CommandLine, HistorySample, Metric, NetworkInterfaceSnapshot, NetworkSnapshot, ProcessSnapshot,
-    Snapshot, SystemSnapshot, UserSource,
+    CommandLine, GpuAdapterSnapshot, GpuSnapshot, HistorySample, Metric, NetworkInterfaceSnapshot,
+    NetworkSnapshot, ProcessSnapshot, Snapshot, SystemSnapshot, UserSource,
 };
 
 /// Collects the first-milestone process and system metrics.
@@ -45,6 +53,7 @@ pub struct Collector {
     users: HashMap<Uid, String>,
     service_accounts: HashMap<String, Option<String>>,
     network_baselines: HashMap<u64, NetworkCounterBaseline>,
+    gpu: GpuCollector,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -52,6 +61,28 @@ struct NetworkCounterBaseline {
     received_bytes: u64,
     transmitted_bytes: u64,
     sampled_at: Instant,
+}
+
+struct GpuCollector {
+    query: Option<GpuPdhQuery>,
+    adapters: Vec<GpuAdapterDescription>,
+    discovery_error: Option<String>,
+}
+
+struct GpuPdhQuery {
+    query: PDH_HQUERY,
+    utilization: PDH_HCOUNTER,
+    dedicated_memory: Option<PDH_HCOUNTER>,
+    shared_memory: Option<PDH_HCOUNTER>,
+    warmed_up: bool,
+}
+
+#[derive(Clone, Debug)]
+struct GpuAdapterDescription {
+    id: u64,
+    name: String,
+    dedicated_memory_capacity_bytes: Option<u64>,
+    shared_memory_capacity_bytes: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -79,6 +110,7 @@ impl Collector {
                 .collect(),
             service_accounts: HashMap::new(),
             network_baselines: HashMap::new(),
+            gpu: GpuCollector::new(),
         }
     }
 
@@ -130,6 +162,7 @@ impl Collector {
             ),
         };
         let network = self.collect_network(previous);
+        let gpu = self.collect_gpu(previous);
 
         let cpu_percent = self.system.global_cpu_usage();
         let logical_cpu_percentages = self
@@ -157,9 +190,55 @@ impl Collector {
                 commit_charge_bytes,
                 commit_limit_bytes,
                 network,
+                gpu,
             },
             processes,
             history,
+        }
+    }
+
+    fn collect_gpu(&mut self, previous: Option<&Snapshot>) -> GpuSnapshot {
+        let utilization = match self.gpu.utilization_by_adapter() {
+            Ok(utilization) => utilization,
+            Err(reason) => {
+                return previous.map_or_else(
+                    || GpuSnapshot {
+                        adapters: Metric::stale(Vec::new(), &reason),
+                    },
+                    |snapshot| GpuSnapshot {
+                        adapters: Metric::stale(
+                            snapshot.system.gpu.adapters.value.clone(),
+                            &reason,
+                        ),
+                    },
+                );
+            }
+        };
+        let (dedicated_memory, shared_memory) = self.gpu.memory_by_adapter();
+        GpuSnapshot {
+            adapters: Metric::fresh(
+                self.gpu
+                    .adapters
+                    .iter()
+                    .map(|adapter| GpuAdapterSnapshot {
+                        id: adapter.id,
+                        name: adapter.name.clone(),
+                        utilization_percent: Metric::fresh(utilization.get(&adapter.id).copied()),
+                        dedicated_memory_used_bytes: Metric::fresh(
+                            dedicated_memory.get(&adapter.id).copied(),
+                        ),
+                        dedicated_memory_capacity_bytes: Metric::fresh(
+                            adapter.dedicated_memory_capacity_bytes,
+                        ),
+                        shared_memory_used_bytes: Metric::fresh(
+                            shared_memory.get(&adapter.id).copied(),
+                        ),
+                        shared_memory_capacity_bytes: Metric::fresh(
+                            adapter.shared_memory_capacity_bytes,
+                        ),
+                    })
+                    .collect(),
+            ),
         }
     }
 
@@ -382,6 +461,237 @@ impl Default for Collector {
     fn default() -> Self {
         Self::new()
     }
+}
+
+impl GpuCollector {
+    fn new() -> Self {
+        let (adapters, discovery_error) = match gpu_adapters() {
+            Ok(adapters) => (adapters, None),
+            Err(error) => (Vec::new(), Some(error)),
+        };
+        let query = GpuPdhQuery::new().ok();
+        Self {
+            query,
+            adapters,
+            discovery_error,
+        }
+    }
+
+    fn utilization_by_adapter(&mut self) -> Result<HashMap<u64, f32>, String> {
+        if let Some(error) = &self.discovery_error {
+            return Err(error.clone());
+        }
+        let Some(query) = &mut self.query else {
+            return Ok(HashMap::new());
+        };
+        query.collect()
+    }
+
+    fn memory_by_adapter(&self) -> (HashMap<u64, u64>, HashMap<u64, u64>) {
+        self.query
+            .as_ref()
+            .map(GpuPdhQuery::memory_by_adapter)
+            .unwrap_or_default()
+    }
+}
+
+impl GpuPdhQuery {
+    fn new() -> Result<Self, String> {
+        let mut query = PDH_HQUERY::default();
+        pdh_result(
+            unsafe { PdhOpenQueryW(PCWSTR::null(), 0, &mut query) },
+            "PdhOpenQueryW",
+        )?;
+        let path = "\\GPU Engine(*)\\Utilization Percentage\0"
+            .encode_utf16()
+            .collect::<Vec<_>>();
+        let mut utilization = PDH_HCOUNTER::default();
+        if let Err(error) = pdh_result(
+            unsafe { PdhAddEnglishCounterW(query, PCWSTR(path.as_ptr()), 0, &mut utilization) },
+            "PdhAddEnglishCounterW(GPU Engine)",
+        ) {
+            unsafe { PdhCloseQuery(query) };
+            return Err(error);
+        }
+        let dedicated_memory =
+            pdh_add_english_counter(query, r"\GPU Adapter Memory(*)\Dedicated Usage").ok();
+        let shared_memory =
+            pdh_add_english_counter(query, r"\GPU Adapter Memory(*)\Shared Usage").ok();
+        Ok(Self {
+            query,
+            utilization,
+            dedicated_memory,
+            shared_memory,
+            warmed_up: false,
+        })
+    }
+
+    fn collect(&mut self) -> Result<HashMap<u64, f32>, String> {
+        pdh_result(
+            unsafe { PdhCollectQueryData(self.query) },
+            "PdhCollectQueryData",
+        )?;
+        if !self.warmed_up {
+            self.warmed_up = true;
+            return Ok(HashMap::new());
+        }
+
+        let items = pdh_counter_array(self.utilization)?;
+        let mut utilization = HashMap::<u64, f32>::new();
+        for (instance, value) in items {
+            let Some(adapter_id) = gpu_luid_from_engine_instance(&instance) else {
+                continue;
+            };
+            if !value.is_finite() {
+                continue;
+            }
+            utilization
+                .entry(adapter_id)
+                .and_modify(|current| *current = current.max(value.clamp(0.0, 100.0)))
+                .or_insert_with(|| value.clamp(0.0, 100.0));
+        }
+        Ok(utilization)
+    }
+
+    fn memory_by_adapter(&self) -> (HashMap<u64, u64>, HashMap<u64, u64>) {
+        let dedicated = self
+            .dedicated_memory
+            .and_then(|counter| pdh_memory_by_adapter(counter).ok())
+            .unwrap_or_default();
+        let shared = self
+            .shared_memory
+            .and_then(|counter| pdh_memory_by_adapter(counter).ok())
+            .unwrap_or_default();
+        (dedicated, shared)
+    }
+}
+
+impl Drop for GpuPdhQuery {
+    fn drop(&mut self) {
+        unsafe { PdhCloseQuery(self.query) };
+    }
+}
+
+fn pdh_result(result: u32, operation: &str) -> Result<(), String> {
+    (result == 0)
+        .then_some(())
+        .ok_or_else(|| format!("{operation} failed with PDH status 0x{result:08X}"))
+}
+
+fn pdh_add_english_counter(query: PDH_HQUERY, path: &str) -> Result<PDH_HCOUNTER, String> {
+    let path = format!("{path}\0").encode_utf16().collect::<Vec<_>>();
+    let mut counter = PDH_HCOUNTER::default();
+    pdh_result(
+        unsafe { PdhAddEnglishCounterW(query, PCWSTR(path.as_ptr()), 0, &mut counter) },
+        "PdhAddEnglishCounterW",
+    )?;
+    Ok(counter)
+}
+
+fn pdh_memory_by_adapter(counter: PDH_HCOUNTER) -> Result<HashMap<u64, u64>, String> {
+    let mut memory = HashMap::new();
+    for (instance, value) in pdh_counter_array(counter)? {
+        let Some(adapter_id) = gpu_luid_from_engine_instance(&instance) else {
+            continue;
+        };
+        if value.is_finite() && value >= 0.0 {
+            memory.insert(adapter_id, value.round() as u64);
+        }
+    }
+    Ok(memory)
+}
+
+fn pdh_counter_array(counter: PDH_HCOUNTER) -> Result<Vec<(String, f32)>, String> {
+    let mut buffer_size = 0;
+    let mut item_count = 0;
+    let first_result = unsafe {
+        PdhGetFormattedCounterArrayW(
+            counter,
+            PDH_FMT_DOUBLE,
+            &mut buffer_size,
+            &mut item_count,
+            None,
+        )
+    };
+    if first_result != PDH_MORE_DATA {
+        return Err(format!(
+            "PdhGetFormattedCounterArrayW size query failed with PDH status 0x{first_result:08X}"
+        ));
+    }
+    let capacity = usize::try_from(buffer_size)
+        .map_err(|_| "PDH counter buffer is too large".to_owned())?
+        .div_ceil(std::mem::size_of::<PDH_FMT_COUNTERVALUE_ITEM_W>());
+    let mut buffer = Vec::<PDH_FMT_COUNTERVALUE_ITEM_W>::with_capacity(capacity);
+    let result = unsafe {
+        PdhGetFormattedCounterArrayW(
+            counter,
+            PDH_FMT_DOUBLE,
+            &mut buffer_size,
+            &mut item_count,
+            Some(buffer.as_mut_ptr()),
+        )
+    };
+    pdh_result(result, "PdhGetFormattedCounterArrayW")?;
+    let item_count = usize::try_from(item_count).map_err(|_| "PDH item count is too large")?;
+    unsafe { buffer.set_len(item_count) };
+    Ok(buffer
+        .into_iter()
+        .filter(|item| {
+            matches!(
+                item.FmtValue.CStatus,
+                PDH_CSTATUS_VALID_DATA | PDH_CSTATUS_NEW_DATA
+            )
+        })
+        .map(|item| {
+            let name = unsafe { item.szName.to_string() }.unwrap_or_default();
+            let value = unsafe { item.FmtValue.Anonymous.doubleValue } as f32;
+            (name, value)
+        })
+        .collect())
+}
+
+fn gpu_adapters() -> Result<Vec<GpuAdapterDescription>, String> {
+    let factory =
+        unsafe { CreateDXGIFactory1::<IDXGIFactory1>() }.map_err(|error| error.to_string())?;
+    let mut adapters = Vec::new();
+    for index in 0.. {
+        let adapter = match unsafe { factory.EnumAdapters1(index) } {
+            Ok(adapter) => adapter,
+            Err(error) if error.code() == DXGI_ERROR_NOT_FOUND => break,
+            Err(error) => return Err(error.to_string()),
+        };
+        let description = unsafe { adapter.GetDesc1() }.map_err(|error| error.to_string())?;
+        if description.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 {
+            continue;
+        }
+        adapters.push(GpuAdapterDescription {
+            id: luid_to_u64(
+                description.AdapterLuid.LowPart,
+                description.AdapterLuid.HighPart,
+            ),
+            name: wide_c_string(&description.Description),
+            dedicated_memory_capacity_bytes: u64::try_from(description.DedicatedVideoMemory)
+                .ok()
+                .filter(|bytes| *bytes > 0),
+            shared_memory_capacity_bytes: u64::try_from(description.SharedSystemMemory)
+                .ok()
+                .filter(|bytes| *bytes > 0),
+        });
+    }
+    Ok(adapters)
+}
+
+fn gpu_luid_from_engine_instance(instance: &str) -> Option<u64> {
+    let (_, suffix) = instance.split_once("luid_0x")?;
+    let (high, suffix) = suffix.split_once("_0x")?;
+    let low = suffix.split('_').next()?;
+    let high = u32::from_str_radix(high, 16).ok()?;
+    let low = u32::from_str_radix(low, 16).ok()?;
+    Some(luid_to_u64(low, high as i32))
+}
+
+fn luid_to_u64(low: u32, high: i32) -> u64 {
+    u64::from(low) | (u64::from(high as u32) << 32)
 }
 
 fn command_line_from_arguments(arguments: &[OsString]) -> CommandLine {
@@ -712,9 +1022,9 @@ fn pages_to_bytes(pages: usize, page_size: usize) -> Result<u64, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Collector, command_line_from_arguments, counter_rate, normalize_process_cpu_percent,
-        normalize_service_account, normalize_system_cpu_percent, pages_to_bytes, stale_metric,
-        well_known_windows_user,
+        Collector, command_line_from_arguments, counter_rate, gpu_luid_from_engine_instance,
+        normalize_process_cpu_percent, normalize_service_account, normalize_system_cpu_percent,
+        pages_to_bytes, stale_metric, well_known_windows_user,
     };
     use crate::model::{CommandLine, Freshness, Metric};
     use std::time::{Duration, Instant};
@@ -750,6 +1060,17 @@ mod tests {
             None
         );
         assert_eq!(counter_rate(100, 200, started_at, started_at), None);
+    }
+
+    #[test]
+    fn gpu_engine_instance_luid_maps_to_the_dxgi_adapter_identity() {
+        assert_eq!(
+            gpu_luid_from_engine_instance(
+                "pid_42_luid_0x00000001_0x00000002_phys_0_eng_0_engtype_3D"
+            ),
+            Some(0x00000001_00000002)
+        );
+        assert_eq!(gpu_luid_from_engine_instance("pid_42_engtype_3D"), None);
     }
 
     #[test]

@@ -7,7 +7,9 @@ use ratatui::{
 };
 
 use crate::{
-    app::{App, CpuDisplayMode, ProcessRow, ProcessViewMode, SortColumn, SortDirection},
+    app::{
+        App, CpuDisplayMode, GpuDisplayMode, ProcessRow, ProcessViewMode, SortColumn, SortDirection,
+    },
     model::{Freshness, History, Metric, Snapshot, SystemSnapshot},
 };
 
@@ -70,11 +72,7 @@ pub fn render(frame: &mut Frame, app: &App) {
             .border_style(Style::default().fg(Color::Cyan)),
     );
     frame.render_widget(cpu, sections[0]);
-    render_resource_panes(
-        frame,
-        sections[1],
-        app.snapshot().map(|snapshot| &snapshot.system),
-    );
+    render_resource_panes(frame, sections[1], app);
 
     let table = Table::new(
         app.viewport_process_rows()
@@ -307,7 +305,8 @@ fn cpu_history_lines(history: Option<&History>, width: usize, height: usize) -> 
     lines
 }
 
-fn render_resource_panes(frame: &mut Frame, area: Rect, system: Option<&SystemSnapshot>) {
+fn render_resource_panes(frame: &mut Frame, area: Rect, app: &App) {
+    let system = app.snapshot().map(|snapshot| &snapshot.system);
     let panes = if area.width >= 110 {
         Layout::default()
             .direction(Direction::Horizontal)
@@ -340,7 +339,7 @@ fn render_resource_panes(frame: &mut Frame, area: Rect, system: Option<&SystemSn
             .to_vec()
     };
     render_memory_pane(frame, panes[0], system);
-    render_gpu_pane(frame, panes[1]);
+    render_gpu_pane(frame, panes[1], system, app.gpu_display_mode());
     render_network_pane(frame, panes[2], system);
 }
 
@@ -378,19 +377,91 @@ fn render_memory_pane(frame: &mut Frame, area: Rect, system: Option<&SystemSnaps
     frame.render_widget(resource_block(" Memory ", lines), area);
 }
 
-fn render_gpu_pane(frame: &mut Frame, area: Rect) {
-    // GPU counters are intentionally not represented as zero until a
-    // hardware-independent Windows source is in place and validated.
-    frame.render_widget(
-        resource_block(
-            " GPU ",
-            vec![
-                Line::from("GPU monitoring unavailable"),
-                Line::from("Windows counter support pending"),
-            ],
-        ),
-        area,
-    );
+fn render_gpu_pane(
+    frame: &mut Frame,
+    area: Rect,
+    system: Option<&SystemSnapshot>,
+    display: GpuDisplayMode,
+) {
+    let Some(system) = system else {
+        frame.render_widget(
+            resource_block(" GPU ", vec![Line::from("Collecting GPU adapters…")]),
+            area,
+        );
+        return;
+    };
+    let adapters = &system.gpu.adapters.value;
+    if adapters.is_empty() {
+        frame.render_widget(
+            resource_block(" GPU ", vec![Line::from("No hardware GPU detected")]),
+            area,
+        );
+        return;
+    }
+    let selected = match display {
+        GpuDisplayMode::Overview => None,
+        GpuDisplayMode::Adapter(id) => adapters.iter().find(|adapter| adapter.id == id),
+    };
+    if let Some(adapter) = selected {
+        let position = adapters
+            .iter()
+            .position(|candidate| candidate.id == adapter.id)
+            .unwrap_or(0)
+            + 1;
+        let title = format!(" GPU — {} ({}/{}) ", adapter.name, position, adapters.len());
+        let utilization = format_optional_percent(&adapter.utilization_percent);
+        let usage = f64::from(adapter.utilization_percent.value.unwrap_or(0.0)) / 100.0;
+        let width = chart_cell_budget_with_label(
+            usize::from(area.width.saturating_sub(2)),
+            12,
+            display_width(&utilization),
+        );
+        let dedicated = optional_memory_readout(
+            &adapter.dedicated_memory_used_bytes,
+            &adapter.dedicated_memory_capacity_bytes,
+        );
+        let shared = optional_memory_readout(
+            &adapter.shared_memory_used_bytes,
+            &adapter.shared_memory_capacity_bytes,
+        );
+        frame.render_widget(
+            resource_block(
+                title,
+                vec![
+                    resource_line_with_label_width(
+                        "Utilization",
+                        12,
+                        &utilization,
+                        display_width(&utilization),
+                        bar(usage, width),
+                    ),
+                    Line::from(format!("Dedicated  {dedicated}")),
+                    Line::from(format!("Shared     {shared}")),
+                ],
+            ),
+            area,
+        );
+    } else {
+        let mut lines = adapters
+            .iter()
+            .take(usize::from(area.height.saturating_sub(2)))
+            .map(|adapter| {
+                Line::from(format!(
+                    "{:<18.18} {:>6}",
+                    adapter.name,
+                    format_optional_percent(&adapter.utilization_percent)
+                ))
+            })
+            .collect::<Vec<_>>();
+        if adapters.len() > lines.len() {
+            lines.push(Line::from(format!(
+                "+{} more adapters",
+                adapters.len() - lines.len()
+            )));
+        }
+        let title = format!(" GPU · {} adapters ", adapters.len());
+        frame.render_widget(resource_block(title, lines), area);
+    }
 }
 
 fn render_network_pane(frame: &mut Frame, area: Rect, system: Option<&SystemSnapshot>) {
@@ -432,7 +503,10 @@ fn render_network_pane(frame: &mut Frame, area: Rect, system: Option<&SystemSnap
     frame.render_widget(resource_block(" Network ", lines), area);
 }
 
-fn resource_block(title: &'static str, lines: Vec<Line<'static>>) -> Paragraph<'static> {
+fn resource_block(
+    title: impl Into<Line<'static>>,
+    lines: Vec<Line<'static>>,
+) -> Paragraph<'static> {
     Paragraph::new(lines)
         .block(
             Block::default()
@@ -531,7 +605,15 @@ fn display_width(text: &str) -> usize {
 }
 
 fn chart_cell_budget(inner_width: usize, value_width: usize) -> usize {
-    inner_width.saturating_sub(LABEL_WIDTH + value_width + COLUMN_GAP)
+    chart_cell_budget_with_label(inner_width, LABEL_WIDTH, value_width)
+}
+
+fn chart_cell_budget_with_label(
+    inner_width: usize,
+    label_width: usize,
+    value_width: usize,
+) -> usize {
+    inner_width.saturating_sub(label_width + value_width + COLUMN_GAP)
 }
 
 fn resource_readout(used: &Metric<u64>, total: &Metric<u64>) -> String {
@@ -550,8 +632,18 @@ fn resource_line(
     value_width: usize,
     chart: Vec<Span<'static>>,
 ) -> Line<'static> {
+    resource_line_with_label_width(label, LABEL_WIDTH, readout, value_width, chart)
+}
+
+fn resource_line_with_label_width(
+    label: &str,
+    label_width: usize,
+    readout: &str,
+    value_width: usize,
+    chart: Vec<Span<'static>>,
+) -> Line<'static> {
     let mut spans = vec![
-        Span::raw(format!("{label:<LABEL_WIDTH$}")),
+        Span::raw(format!("{label:<label_width$}")),
         Span::styled(
             format!("{readout:>value_width$}"),
             Style::default().fg(Color::White),
@@ -675,15 +767,17 @@ fn footer_text(app: &App) -> String {
         )
     } else if app.filter().is_empty() {
         if app.view_mode() == ProcessViewMode::Tree {
-            format!("{stale_prefix}{status_prefix}c CPU  t Flat  x Kill  s Sort  / Filter  q Quit")
+            format!(
+                "{stale_prefix}{status_prefix}c CPU  g GPU  t Flat  x Kill  s Sort  / Filter  q Quit"
+            )
         } else {
             format!(
-                "{stale_prefix}{status_prefix}c CPU  t Tree  x Kill  s Sort  S Reverse  / Filter  q Quit"
+                "{stale_prefix}{status_prefix}c CPU  g GPU  t Tree  x Kill  s Sort  S Reverse  / Filter  q Quit"
             )
         }
     } else {
         format!(
-            "{stale_prefix}{status_prefix}Filter: {}  c CPU  t View  x Kill  s Sort  S Reverse  / Edit  q Quit",
+            "{stale_prefix}{status_prefix}Filter: {}  c CPU  g GPU  t View  x Kill  s Sort  S Reverse  / Edit  q Quit",
             app.filter()
         )
     }
@@ -734,6 +828,14 @@ fn snapshot_is_stale(snapshot: &Snapshot) -> bool {
                 metric_is_stale(&interface.transmit_bytes_per_second)
                     || metric_is_stale(&interface.receive_bytes_per_second)
             })
+        || metric_is_stale(&snapshot.system.gpu.adapters)
+        || snapshot.system.gpu.adapters.value.iter().any(|adapter| {
+            metric_is_stale(&adapter.utilization_percent)
+                || metric_is_stale(&adapter.dedicated_memory_used_bytes)
+                || metric_is_stale(&adapter.dedicated_memory_capacity_bytes)
+                || metric_is_stale(&adapter.shared_memory_used_bytes)
+                || metric_is_stale(&adapter.shared_memory_capacity_bytes)
+        })
         || metric_is_stale(&snapshot.processes)
         || snapshot
             .processes
@@ -793,6 +895,29 @@ fn format_rate(metric: &Metric<Option<f64>>) -> String {
         return format!("{marker}—");
     };
     format!("{marker}{}/s", format_bytes(rate.round() as u64))
+}
+
+fn format_optional_percent(metric: &Metric<Option<f32>>) -> String {
+    metric.value.map_or_else(
+        || format!("{}—", freshness_marker(metric)),
+        |value| {
+            format!(
+                "{}{}",
+                freshness_marker(metric),
+                format_percent_value(value)
+            )
+        },
+    )
+}
+
+fn optional_memory_readout(used: &Metric<Option<u64>>, capacity: &Metric<Option<u64>>) -> String {
+    match (used.value, capacity.value) {
+        (Some(used), Some(capacity)) => {
+            format!("{}/{}", format_bytes(used), format_bytes(capacity))
+        }
+        (None, Some(capacity)) => format!("—/{}", format_bytes(capacity)),
+        _ => "—".into(),
+    }
 }
 
 #[cfg(test)]
@@ -939,6 +1064,7 @@ mod tests {
             commit_charge_bytes: Metric::stale(u64::MAX, "query failed"),
             commit_limit_bytes: Metric::fresh(u64::MAX),
             network: NetworkSnapshot::default(),
+            gpu: Default::default(),
         };
 
         for line in cpu_lines(Some(&system), None, 58, CpuDisplayMode::Summary, 8)

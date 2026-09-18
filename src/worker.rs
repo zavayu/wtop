@@ -155,6 +155,7 @@ mod tests {
                 commit_charge_bytes: Metric::fresh(0),
                 commit_limit_bytes: Metric::fresh(0),
                 network: Default::default(),
+                gpu: Default::default(),
             },
             processes: Metric::fresh(Vec::new()),
             history: History::default(),
