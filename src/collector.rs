@@ -4,10 +4,30 @@ use std::{
     time::Instant,
 };
 
-use sysinfo::{Process, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
-use windows::Win32::System::ProcessStatus::{GetPerformanceInfo, PERFORMANCE_INFORMATION};
+use sysinfo::{Process, ProcessRefreshKind, ProcessesToUpdate, System, Uid, UpdateKind, Users};
+use windows::{
+    Win32::{
+        Foundation::{CloseHandle, ERROR_NO_MORE_FILES},
+        System::{
+            Diagnostics::ToolHelp::{
+                CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+                TH32CS_SNAPPROCESS,
+            },
+            ProcessStatus::{GetPerformanceInfo, PERFORMANCE_INFORMATION},
+            Services::{
+                CloseServiceHandle, ENUM_SERVICE_STATUS_PROCESSW, EnumServicesStatusExW,
+                OpenSCManagerW, OpenServiceW, QUERY_SERVICE_CONFIGW, QueryServiceConfigW,
+                SC_ENUM_PROCESS_INFO, SC_MANAGER_ENUMERATE_SERVICE, SERVICE_ACTIVE,
+                SERVICE_QUERY_CONFIG, SERVICE_WIN32,
+            },
+        },
+    },
+    core::{HRESULT, PCWSTR},
+};
 
-use crate::model::{CommandLine, HistorySample, Metric, ProcessSnapshot, Snapshot, SystemSnapshot};
+use crate::model::{
+    CommandLine, HistorySample, Metric, ProcessSnapshot, Snapshot, SystemSnapshot, UserSource,
+};
 
 /// Collects the first-milestone process and system metrics.
 ///
@@ -17,6 +37,8 @@ pub struct Collector {
     system: System,
     generation: u64,
     command_lines: HashMap<ProcessIdentity, CommandLine>,
+    users: HashMap<Uid, String>,
+    service_accounts: HashMap<String, Option<String>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -25,12 +47,24 @@ struct ProcessIdentity {
     start_time: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ServiceAccount {
+    Account(String),
+    Mixed,
+}
+
 impl Collector {
     pub fn new() -> Self {
         Self {
             system: System::new(),
             generation: 0,
             command_lines: HashMap::new(),
+            users: Users::new_with_refreshed_list()
+                .list()
+                .iter()
+                .map(|user| (user.id().clone(), user.name().to_owned()))
+                .collect(),
+            service_accounts: HashMap::new(),
         }
     }
 
@@ -44,12 +78,21 @@ impl Collector {
         let updated_processes = self.system.refresh_processes_specifics(
             ProcessesToUpdate::All,
             true,
-            ProcessRefreshKind::nothing().with_cpu().with_memory(),
+            ProcessRefreshKind::nothing()
+                .with_cpu()
+                .with_memory()
+                .with_user(UpdateKind::OnlyIfNotSet),
         );
         self.refresh_new_process_details();
 
         self.generation = self.generation.saturating_add(1);
 
+        let thread_counts = match thread_counts() {
+            Ok(counts) => Metric::fresh(counts),
+            Err(reason) => Metric::stale(HashMap::new(), reason),
+        };
+        let service_accounts =
+            service_accounts_by_pid(&mut self.service_accounts).unwrap_or_default();
         let processes = match previous {
             Some(snapshot) if updated_processes == 0 && !snapshot.processes.value.is_empty() => {
                 Metric::stale(
@@ -57,7 +100,7 @@ impl Collector {
                     "process refresh returned no processes",
                 )
             }
-            _ => Metric::fresh(self.collect_processes()),
+            _ => Metric::fresh(self.collect_processes(previous, &thread_counts, &service_accounts)),
         };
         let (commit_charge_bytes, commit_limit_bytes) = match commit_metrics() {
             Ok((charge, limit)) => (Metric::fresh(charge), Metric::fresh(limit)),
@@ -104,9 +147,14 @@ impl Collector {
         }
     }
 
-    fn collect_processes(&mut self) -> Vec<ProcessSnapshot> {
+    fn collect_processes(
+        &mut self,
+        previous: Option<&Snapshot>,
+        thread_counts: &Metric<HashMap<u32, u64>>,
+        service_accounts: &HashMap<u32, ServiceAccount>,
+    ) -> Vec<ProcessSnapshot> {
         let mut live_processes = HashSet::new();
-        let (system, command_lines) = (&self.system, &mut self.command_lines);
+        let (system, command_lines, users) = (&self.system, &mut self.command_lines, &self.users);
         let logical_cpu_count = system.cpus().len();
         let mut processes = system
             .processes()
@@ -118,16 +166,57 @@ impl Collector {
                 };
                 live_processes.insert(identity);
 
+                let token_user = process.user_id().map(|uid| {
+                    let sid = uid.to_string();
+                    well_known_windows_user(&sid)
+                        .map(str::to_owned)
+                        .or_else(|| users.get(uid).cloned())
+                        .unwrap_or(sid)
+                });
+                let (user, user_source) = match token_user {
+                    Some(user) => (Some(user), UserSource::Token),
+                    None => match service_accounts.get(&identity.pid) {
+                        Some(ServiceAccount::Account(account)) => {
+                            (Some(account.clone()), UserSource::ServiceConfiguration)
+                        }
+                        Some(ServiceAccount::Mixed) => (
+                            Some("<mixed service accounts>".into()),
+                            UserSource::ServiceConfiguration,
+                        ),
+                        None => (None, UserSource::Restricted),
+                    },
+                };
+
                 ProcessSnapshot {
                     pid: identity.pid,
                     parent_pid: process.parent().map(|pid| pid.as_u32()),
                     name: process.name().to_string_lossy().into_owned(),
+                    user,
+                    user_source,
                     command_line: cached_command_line(command_lines, identity, process),
                     executable_path: process.exe().map(ToOwned::to_owned),
                     cpu_percent: normalize_process_cpu_percent(
                         process.cpu_usage(),
                         logical_cpu_count,
                     ),
+                    thread_count: Metric {
+                        value: thread_counts
+                            .value
+                            .get(&identity.pid)
+                            .copied()
+                            .or_else(|| {
+                                previous.and_then(|snapshot| {
+                                    snapshot
+                                        .processes
+                                        .value
+                                        .iter()
+                                        .find(|process| process.pid == identity.pid)
+                                        .map(|process| process.thread_count.value)
+                                })
+                            })
+                            .unwrap_or(0),
+                        freshness: thread_counts.freshness.clone(),
+                    },
                     memory_bytes: process.memory(),
                 }
             })
@@ -166,7 +255,8 @@ impl Collector {
             false,
             ProcessRefreshKind::nothing()
                 .with_cmd(UpdateKind::Always)
-                .with_exe(UpdateKind::Always),
+                .with_exe(UpdateKind::Always)
+                .with_user(UpdateKind::OnlyIfNotSet),
         );
     }
 }
@@ -226,6 +316,193 @@ fn stale_metric(previous: Option<&Metric<u64>>, reason: &str) -> Metric<u64> {
     Metric::stale(value, reason)
 }
 
+/// Returns concise names for Windows service accounts whose SIDs are stable
+/// and commonly encountered even when they are absent from sysinfo's account
+/// list.
+fn well_known_windows_user(sid: &str) -> Option<&'static str> {
+    match sid {
+        "S-1-5-18" => Some("SYSTEM"),
+        "S-1-5-19" => Some("LOCAL SERVICE"),
+        "S-1-5-20" => Some("NETWORK SERVICE"),
+        _ => None,
+    }
+}
+
+/// Maps running service PIDs to their configured logon account. This provides
+/// useful attribution when Windows denies access to a service process token.
+/// The result is deliberately conservative: a PID with services configured
+/// for different accounts is marked `Mixed`, never assigned an arbitrary one.
+fn service_accounts_by_pid(
+    cached_accounts: &mut HashMap<String, Option<String>>,
+) -> Result<HashMap<u32, ServiceAccount>, String> {
+    let manager =
+        unsafe { OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_ENUMERATE_SERVICE) }
+            .map_err(|error| error.to_string())?;
+
+    let result = (|| {
+        let mut by_pid = HashMap::<u32, Vec<Option<String>>>::new();
+        let mut resume_handle = 0;
+
+        loop {
+            // SCM may return its service list in batches. `usize` storage keeps
+            // the embedded service structures and their wide-string pointers
+            // suitably aligned while the batch is parsed.
+            let mut storage = vec![0_usize; 32 * 1024];
+            let byte_len = storage.len() * std::mem::size_of::<usize>();
+            let buffer = unsafe {
+                std::slice::from_raw_parts_mut(storage.as_mut_ptr().cast::<u8>(), byte_len)
+            };
+            let mut bytes_needed = 0;
+            let mut services_returned = 0;
+            let enumeration = unsafe {
+                EnumServicesStatusExW(
+                    manager,
+                    SC_ENUM_PROCESS_INFO,
+                    SERVICE_WIN32,
+                    SERVICE_ACTIVE,
+                    Some(buffer),
+                    &mut bytes_needed,
+                    &mut services_returned,
+                    Some(&mut resume_handle),
+                    PCWSTR::null(),
+                )
+            };
+
+            let entries = unsafe {
+                std::slice::from_raw_parts(
+                    storage.as_ptr().cast::<ENUM_SERVICE_STATUS_PROCESSW>(),
+                    services_returned as usize,
+                )
+            };
+            for entry in entries {
+                let pid = entry.ServiceStatusProcess.dwProcessId;
+                if pid == 0 {
+                    continue;
+                }
+
+                let service_name = unsafe { entry.lpServiceName.to_string() }
+                    .map_err(|error| error.to_string())?;
+                let account = cached_accounts
+                    .entry(service_name.clone())
+                    .or_insert_with(|| service_start_account(manager, &service_name));
+                by_pid.entry(pid).or_default().push(account.clone());
+            }
+
+            match enumeration {
+                Ok(()) => break,
+                Err(error) if error.code() == HRESULT::from_win32(234) => continue,
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+
+        Ok(by_pid
+            .into_iter()
+            .filter_map(|(pid, accounts)| {
+                let accounts = accounts.into_iter().collect::<Option<HashSet<_>>>()?;
+                (accounts.len() == 1)
+                    .then(|| ServiceAccount::Account(accounts.into_iter().next().unwrap()))
+                    .or(Some(ServiceAccount::Mixed))
+                    .map(|account| (pid, account))
+            })
+            .collect())
+    })();
+
+    let close_result = unsafe { CloseServiceHandle(manager) }.map_err(|error| error.to_string());
+    match (result, close_result) {
+        (Err(error), _) | (_, Err(error)) => Err(error),
+        (Ok(accounts), Ok(())) => Ok(accounts),
+    }
+}
+
+fn service_start_account(
+    manager: windows::Win32::System::Services::SC_HANDLE,
+    name: &str,
+) -> Option<String> {
+    let wide_name = name.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
+    let service = unsafe {
+        OpenServiceW(
+            manager,
+            PCWSTR::from_raw(wide_name.as_ptr()),
+            SERVICE_QUERY_CONFIG,
+        )
+    }
+    .ok()?;
+
+    let result = (|| {
+        let mut bytes_needed = 0;
+        let _ = unsafe { QueryServiceConfigW(service, None, 0, &mut bytes_needed) };
+        if bytes_needed == 0 {
+            return None;
+        }
+
+        let storage_len = (bytes_needed as usize).div_ceil(std::mem::size_of::<usize>());
+        let mut storage = vec![0_usize; storage_len];
+        let config = storage.as_mut_ptr().cast::<QUERY_SERVICE_CONFIGW>();
+        unsafe { QueryServiceConfigW(service, Some(config), bytes_needed, &mut bytes_needed) }
+            .ok()?;
+        let start_name = unsafe { (*config).lpServiceStartName.to_string() }.ok()?;
+        Some(normalize_service_account(&start_name))
+    })();
+
+    let _ = unsafe { CloseServiceHandle(service) };
+    result
+}
+
+fn normalize_service_account(account: &str) -> String {
+    if account.eq_ignore_ascii_case("LocalSystem")
+        || account.eq_ignore_ascii_case("NT AUTHORITY\\LocalSystem")
+        || account.eq_ignore_ascii_case("NT AUTHORITY\\SYSTEM")
+    {
+        "SYSTEM".into()
+    } else if account.eq_ignore_ascii_case("LocalService")
+        || account.eq_ignore_ascii_case("NT AUTHORITY\\LocalService")
+        || account.eq_ignore_ascii_case("NT AUTHORITY\\LOCAL SERVICE")
+    {
+        "LOCAL SERVICE".into()
+    } else if account.eq_ignore_ascii_case("NetworkService")
+        || account.eq_ignore_ascii_case("NT AUTHORITY\\NetworkService")
+        || account.eq_ignore_ascii_case("NT AUTHORITY\\NETWORK SERVICE")
+    {
+        "NETWORK SERVICE".into()
+    } else {
+        account.to_owned()
+    }
+}
+
+/// Returns the number of threads currently reported for each process by the
+/// Windows Tool Help snapshot. This is intentionally a separate query because
+/// sysinfo does not expose a Windows thread count per process.
+fn thread_counts() -> Result<HashMap<u32, u64>, String> {
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }
+        .map_err(|error| error.to_string())?;
+
+    let result: Result<HashMap<u32, u64>, String> = (|| {
+        let mut entry = PROCESSENTRY32W {
+            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+        unsafe { Process32FirstW(snapshot, &mut entry) }.map_err(|error| error.to_string())?;
+
+        let mut counts = HashMap::new();
+        loop {
+            counts.insert(entry.th32ProcessID, u64::from(entry.cntThreads));
+
+            match unsafe { Process32NextW(snapshot, &mut entry) } {
+                Ok(()) => {}
+                Err(error) if error.code() == HRESULT::from_win32(ERROR_NO_MORE_FILES.0) => break,
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        Ok(counts)
+    })();
+
+    let close_result = unsafe { CloseHandle(snapshot) }.map_err(|error| error.to_string());
+    match (result, close_result) {
+        (Err(error), _) | (_, Err(error)) => Err(error),
+        (Ok(counts), Ok(())) => Ok(counts),
+    }
+}
+
 fn commit_metrics() -> Result<(u64, u64), String> {
     let mut performance = PERFORMANCE_INFORMATION {
         cb: std::mem::size_of::<PERFORMANCE_INFORMATION>() as u32,
@@ -260,7 +537,8 @@ fn pages_to_bytes(pages: usize, page_size: usize) -> Result<u64, String> {
 mod tests {
     use super::{
         Collector, command_line_from_arguments, normalize_process_cpu_percent,
-        normalize_system_cpu_percent, pages_to_bytes, stale_metric,
+        normalize_service_account, normalize_system_cpu_percent, pages_to_bytes, stale_metric,
+        well_known_windows_user,
     };
     use crate::model::{CommandLine, Freshness, Metric};
 
@@ -288,6 +566,43 @@ mod tests {
             Freshness::Stale {
                 reason: "performance query failed".into(),
             }
+        );
+    }
+
+    #[test]
+    fn well_known_service_sids_have_concise_labels() {
+        assert_eq!(well_known_windows_user("S-1-5-18"), Some("SYSTEM"));
+        assert_eq!(well_known_windows_user("S-1-5-19"), Some("LOCAL SERVICE"));
+        assert_eq!(well_known_windows_user("S-1-5-20"), Some("NETWORK SERVICE"));
+        assert_eq!(well_known_windows_user("S-1-5-21-123"), None);
+    }
+
+    #[test]
+    fn service_configuration_accounts_are_normalized_for_display() {
+        assert_eq!(normalize_service_account("LocalSystem"), "SYSTEM");
+        assert_eq!(
+            normalize_service_account("NT AUTHORITY\\LocalSystem"),
+            "SYSTEM"
+        );
+        assert_eq!(
+            normalize_service_account("NT AUTHORITY\\LocalService"),
+            "LOCAL SERVICE"
+        );
+        assert_eq!(
+            normalize_service_account("NT AUTHORITY\\LOCAL SERVICE"),
+            "LOCAL SERVICE"
+        );
+        assert_eq!(
+            normalize_service_account("NetworkService"),
+            "NETWORK SERVICE"
+        );
+        assert_eq!(
+            normalize_service_account("NT AUTHORITY\\NetworkService"),
+            "NETWORK SERVICE"
+        );
+        assert_eq!(
+            normalize_service_account("CONTOSO\\agent"),
+            "CONTOSO\\agent"
         );
     }
 

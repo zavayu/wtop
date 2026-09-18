@@ -53,11 +53,29 @@ pub struct ProcessSnapshot {
     pub pid: u32,
     pub parent_pid: Option<u32>,
     pub name: String,
+    /// Best-effort account name or SID for the process owner.
+    pub user: Option<String>,
+    /// Indicates how the displayed owner was obtained.
+    pub user_source: UserSource,
     pub command_line: CommandLine,
     pub executable_path: Option<PathBuf>,
     /// Percentage of total logical CPU capacity used by this process (0-100).
     pub cpu_percent: f32,
+    /// Number of threads reported by the latest ToolHelp process snapshot.
+    pub thread_count: Metric<u64>,
     pub memory_bytes: u64,
+}
+
+/// The confidence level of a process owner label.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum UserSource {
+    /// The process access token supplied the owner SID.
+    #[default]
+    Token,
+    /// The Service Control Manager supplied the configured service account.
+    ServiceConfiguration,
+    /// Windows did not allow the process token or an SCM fallback to be read.
+    Restricted,
 }
 
 impl ProcessSnapshot {
@@ -72,6 +90,18 @@ impl ProcessSnapshot {
                 |path| format!("<unavailable> {}", path.display()),
             ),
             CommandLine::NotRequested => "<pending>".into(),
+        }
+    }
+
+    pub fn user_display(&self) -> &str {
+        // PID 4 is Windows' kernel-owned System process. It has no user token,
+        // so calling it unknown hides useful information from the operator.
+        if self.pid == 4 {
+            "<kernel>"
+        } else if self.user_source == UserSource::Restricted {
+            "<restricted>"
+        } else {
+            self.user.as_deref().unwrap_or("<unknown>")
         }
     }
 }
@@ -157,7 +187,11 @@ pub struct Snapshot {
 
 #[cfg(test)]
 mod tests {
-    use super::{Freshness, HISTORY_CAPACITY, History, HistorySample, Metric};
+    use super::{
+        CommandLine, Freshness, HISTORY_CAPACITY, History, HistorySample, Metric, ProcessSnapshot,
+        UserSource,
+    };
+    use std::path::PathBuf;
 
     #[test]
     fn stale_metrics_keep_the_last_value_and_reason() {
@@ -170,6 +204,44 @@ mod tests {
                 reason: "system query failed".into(),
             }
         );
+    }
+
+    #[test]
+    fn user_display_marks_a_missing_process_owner() {
+        let mut process = ProcessSnapshot {
+            pid: 1,
+            parent_pid: None,
+            name: "example.exe".into(),
+            user: None,
+            user_source: UserSource::Token,
+            command_line: CommandLine::NotRequested,
+            executable_path: Some(PathBuf::from("example.exe")),
+            cpu_percent: 0.0,
+            thread_count: Metric::fresh(1),
+            memory_bytes: 0,
+        };
+        assert_eq!(process.user_display(), "<unknown>");
+
+        process.user = Some("Alice".into());
+        assert_eq!(process.user_display(), "Alice");
+    }
+
+    #[test]
+    fn system_process_displays_as_kernel_not_unknown() {
+        let process = ProcessSnapshot {
+            pid: 4,
+            parent_pid: None,
+            name: "System".into(),
+            user: None,
+            user_source: UserSource::Restricted,
+            command_line: CommandLine::NotRequested,
+            executable_path: None,
+            cpu_percent: 0.0,
+            thread_count: Metric::fresh(1),
+            memory_bytes: 0,
+        };
+
+        assert_eq!(process.user_display(), "<kernel>");
     }
 
     #[test]

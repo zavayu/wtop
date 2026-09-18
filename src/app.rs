@@ -5,10 +5,7 @@ use std::{
 
 use crossterm::event::{KeyCode, KeyModifiers};
 
-use crate::{
-    model::{CommandLine, ProcessSnapshot, Snapshot},
-    text::maximum_scroll_offset,
-};
+use crate::model::{CommandLine, ProcessSnapshot, Snapshot};
 
 /// Owns the application state that is independent of terminal rendering.
 ///
@@ -21,8 +18,6 @@ pub struct App {
     selected_pid: Option<u32>,
     vertical_offset: usize,
     viewport_rows: usize,
-    command_line_offset_cells: u16,
-    command_line_viewport_cells: u16,
     view_mode: ProcessViewMode,
     cpu_display_mode: CpuDisplayMode,
     collapsed_pids: HashSet<u32>,
@@ -37,6 +32,8 @@ pub enum SortColumn {
     #[default]
     Pid,
     Name,
+    User,
+    ThreadCount,
     CpuPercent,
     Memory,
 }
@@ -116,10 +113,6 @@ impl App {
         self.ensure_selected_row_is_visible();
     }
 
-    pub fn command_line_offset_cells(&self) -> u16 {
-        self.command_line_offset_cells
-    }
-
     pub fn view_mode(&self) -> ProcessViewMode {
         self.view_mode
     }
@@ -144,16 +137,6 @@ impl App {
         self.reconcile_selection(previous_index);
     }
 
-    pub fn set_command_line_offset_cells(&mut self, offset: u16) {
-        self.command_line_offset_cells = offset;
-        self.clamp_command_line_offset();
-    }
-
-    pub fn set_command_line_viewport_cells(&mut self, viewport_cells: u16) {
-        self.command_line_viewport_cells = viewport_cells;
-        self.clamp_command_line_offset();
-    }
-
     pub fn sort(&self) -> SortSpec {
         self.sort
     }
@@ -167,7 +150,9 @@ impl App {
     pub fn cycle_sort_column(&mut self) {
         let next_column = match self.sort.column {
             SortColumn::Pid => SortColumn::Name,
-            SortColumn::Name => SortColumn::CpuPercent,
+            SortColumn::Name => SortColumn::User,
+            SortColumn::User => SortColumn::ThreadCount,
+            SortColumn::ThreadCount => SortColumn::CpuPercent,
             SortColumn::CpuPercent => SortColumn::Memory,
             SortColumn::Memory => SortColumn::Pid,
         };
@@ -223,8 +208,6 @@ impl App {
                 let last_index = self.visible_processes().len().saturating_sub(1);
                 self.move_selection_to(last_index);
             }
-            KeyCode::Left => self.move_command_line_left(),
-            KeyCode::Right => self.move_command_line_right(),
             KeyCode::Enter | KeyCode::Char(' ') => self.toggle_selected_expansion(),
             _ => {}
         }
@@ -290,7 +273,6 @@ impl App {
 
         if can_select {
             self.selected_pid = Some(pid);
-            self.command_line_offset_cells = 0;
             true
         } else {
             false
@@ -389,7 +371,6 @@ impl App {
         if let Some(next_selected_pid) = next_selected_pid {
             if self.selected_pid != Some(next_selected_pid) {
                 self.selected_pid = Some(next_selected_pid);
-                self.command_line_offset_cells = 0;
             }
             self.ensure_selected_row_is_visible();
         }
@@ -418,15 +399,6 @@ impl App {
         self.ensure_selected_row_is_visible();
     }
 
-    fn move_command_line_left(&mut self) {
-        self.command_line_offset_cells = self.command_line_offset_cells.saturating_sub(1);
-    }
-
-    fn move_command_line_right(&mut self) {
-        self.command_line_offset_cells = self.command_line_offset_cells.saturating_add(1);
-        self.clamp_command_line_offset();
-    }
-
     fn selected_index(&self) -> Option<usize> {
         let selected_pid = self.selected_pid?;
         self.visible_processes()
@@ -435,19 +407,19 @@ impl App {
     }
 
     fn reconcile_selection(&mut self, previous_index: Option<usize>) {
-        let (next_selected_pid, reset_vertical_offset, reset_command_offset) = {
+        let (next_selected_pid, reset_vertical_offset) = {
             let processes = self.visible_processes();
 
             if processes.is_empty() {
-                (None, true, true)
+                (None, true)
             } else if self
                 .selected_pid
                 .is_some_and(|pid| processes.iter().any(|process| process.pid == pid))
             {
-                (self.selected_pid, false, false)
+                (self.selected_pid, false)
             } else {
                 let replacement_index = previous_index.unwrap_or(0).min(processes.len() - 1);
-                (Some(processes[replacement_index].pid), false, true)
+                (Some(processes[replacement_index].pid), false)
             }
         };
 
@@ -455,11 +427,7 @@ impl App {
         if reset_vertical_offset {
             self.vertical_offset = 0;
         }
-        if reset_command_offset {
-            self.command_line_offset_cells = 0;
-        }
         self.ensure_selected_row_is_visible();
-        self.clamp_command_line_offset();
     }
 
     fn ensure_selected_row_is_visible(&mut self) {
@@ -480,35 +448,15 @@ impl App {
             }
         }
     }
-
-    fn clamp_command_line_offset(&mut self) {
-        let maximum_offset = self.selected_command_line_maximum_offset();
-        self.command_line_offset_cells = self.command_line_offset_cells.min(maximum_offset);
-    }
-
-    fn selected_command_line_maximum_offset(&self) -> u16 {
-        let Some(selected_pid) = self.selected_pid else {
-            return 0;
-        };
-
-        self.visible_processes()
-            .into_iter()
-            .find(|process| process.pid == selected_pid)
-            .map(|process| {
-                maximum_scroll_offset(
-                    &process.command_line_display(),
-                    self.command_line_viewport_cells,
-                )
-            })
-            .unwrap_or(0)
-    }
 }
 
 impl SortSpec {
     fn for_column(column: SortColumn) -> Self {
         let direction = match column {
-            SortColumn::Pid | SortColumn::Name => SortDirection::Ascending,
-            SortColumn::CpuPercent | SortColumn::Memory => SortDirection::Descending,
+            SortColumn::Pid | SortColumn::Name | SortColumn::User => SortDirection::Ascending,
+            SortColumn::ThreadCount | SortColumn::CpuPercent | SortColumn::Memory => {
+                SortDirection::Descending
+            }
         };
         Self { column, direction }
     }
@@ -743,6 +691,11 @@ fn compare_processes(
     let comparison = match sort.column {
         SortColumn::Pid => left.pid.cmp(&right.pid),
         SortColumn::Name => left.name.to_lowercase().cmp(&right.name.to_lowercase()),
+        SortColumn::User => left
+            .user_display()
+            .to_lowercase()
+            .cmp(&right.user_display().to_lowercase()),
+        SortColumn::ThreadCount => left.thread_count.value.cmp(&right.thread_count.value),
         SortColumn::CpuPercent => left.cpu_percent.total_cmp(&right.cpu_percent),
         SortColumn::Memory => left.memory_bytes.cmp(&right.memory_bytes),
     };
@@ -760,10 +713,14 @@ fn process_matches_filter(process: &ProcessSnapshot, lowercase_filter: &str) -> 
         return true;
     }
 
-    matches!(
-        &process.command_line,
-        CommandLine::Present(command_line) if command_line.to_lowercase().contains(lowercase_filter)
-    )
+    process
+        .user_display()
+        .to_lowercase()
+        .contains(lowercase_filter)
+        || matches!(
+            &process.command_line,
+            CommandLine::Present(command_line) if command_line.to_lowercase().contains(lowercase_filter)
+        )
 }
 
 #[cfg(test)]
@@ -771,7 +728,9 @@ mod tests {
     use std::{sync::Arc, time::Instant};
 
     use super::{App, CpuDisplayMode, ProcessViewMode, SortColumn, SortDirection, SortSpec};
-    use crate::model::{CommandLine, Metric, ProcessSnapshot, Snapshot, SystemSnapshot};
+    use crate::model::{
+        CommandLine, Metric, ProcessSnapshot, Snapshot, SystemSnapshot, UserSource,
+    };
     use crossterm::event::{KeyCode, KeyModifiers};
 
     fn process(
@@ -784,9 +743,12 @@ mod tests {
             pid,
             parent_pid: None,
             name: name.into(),
+            user: None,
+            user_source: UserSource::Token,
             command_line,
             executable_path: None,
             cpu_percent,
+            thread_count: Metric::fresh(0),
             memory_bytes: u64::from(pid) * 1024,
         }
     }
@@ -857,6 +819,33 @@ mod tests {
         app.set_filter("missing");
         assert!(app.visible_processes().is_empty());
         assert_eq!(app.selected_pid(), None);
+    }
+
+    #[test]
+    fn filtering_and_sorting_support_user_and_thread_columns() {
+        let mut first = process(9, "first.exe", CommandLine::NotRequested, 0.0);
+        first.user = Some("SYSTEM".into());
+        first.thread_count = Metric::fresh(4);
+        let mut second = process(3, "second.exe", CommandLine::NotRequested, 0.0);
+        second.user = Some("Alice".into());
+        second.thread_count = Metric::fresh(12);
+
+        let mut app = App::new();
+        app.set_snapshot(snapshot(vec![first, second]));
+        app.set_filter("alice");
+        assert_eq!(app.visible_processes()[0].pid, 3);
+
+        app.set_filter("");
+        app.set_sort(SortSpec {
+            column: SortColumn::ThreadCount,
+            direction: SortDirection::Descending,
+        });
+        let pids = app
+            .visible_processes()
+            .into_iter()
+            .map(|process| process.pid)
+            .collect::<Vec<_>>();
+        assert_eq!(pids, vec![3, 9]);
     }
 
     #[test]
@@ -1023,46 +1012,6 @@ mod tests {
     }
 
     #[test]
-    fn command_line_navigation_clamps_and_resets_for_a_new_selection() {
-        let mut app = App::new();
-        app.set_viewport_rows(2);
-        app.set_command_line_viewport_cells(4);
-        app.set_snapshot(snapshot(vec![
-            process(1, "first.exe", CommandLine::Present("abcdef".into()), 0.0),
-            process(2, "second.exe", CommandLine::Present("uvwxyz".into()), 0.0),
-        ]));
-
-        for _ in 0..10 {
-            app.handle_key(KeyCode::Right);
-        }
-        assert_eq!(app.command_line_offset_cells(), 3);
-
-        app.handle_key(KeyCode::Left);
-        assert_eq!(app.command_line_offset_cells(), 2);
-
-        app.handle_key(KeyCode::Down);
-        assert_eq!(app.selected_pid(), Some(2));
-        assert_eq!(app.command_line_offset_cells(), 0);
-    }
-
-    #[test]
-    fn widening_the_command_line_viewport_clamps_the_offset() {
-        let mut app = App::new();
-        app.set_command_line_viewport_cells(4);
-        app.set_snapshot(snapshot(vec![process(
-            1,
-            "worker.exe",
-            CommandLine::Present("abcdef".into()),
-            0.0,
-        )]));
-
-        app.set_command_line_offset_cells(3);
-        app.set_command_line_viewport_cells(6);
-
-        assert_eq!(app.command_line_offset_cells(), 0);
-    }
-
-    #[test]
     fn sort_shortcuts_cycle_columns_with_their_default_directions() {
         let mut app = App::new();
 
@@ -1072,6 +1021,24 @@ mod tests {
             SortSpec {
                 column: SortColumn::Name,
                 direction: SortDirection::Ascending,
+            }
+        );
+
+        app.handle_key(KeyCode::Char('s'));
+        assert_eq!(
+            app.sort(),
+            SortSpec {
+                column: SortColumn::User,
+                direction: SortDirection::Ascending,
+            }
+        );
+
+        app.handle_key(KeyCode::Char('s'));
+        assert_eq!(
+            app.sort(),
+            SortSpec {
+                column: SortColumn::ThreadCount,
+                direction: SortDirection::Descending,
             }
         );
 

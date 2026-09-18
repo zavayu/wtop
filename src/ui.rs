@@ -8,21 +8,17 @@ use ratatui::{
 
 use crate::{
     app::{App, CpuDisplayMode, ProcessRow, ProcessViewMode, SortColumn, SortDirection},
-    model::{Freshness, History, HistorySample, Metric, ProcessSnapshot, Snapshot, SystemSnapshot},
-    text::scroll_text,
+    model::{Freshness, History, HistorySample, Metric, Snapshot, SystemSnapshot},
 };
 
-const MINIMUM_WIDTH: u16 = 60;
+const MINIMUM_WIDTH: u16 = 64;
 const MINIMUM_HEIGHT: u16 = 12;
 const PID_COLUMN_WIDTH: u16 = 7;
-const NAME_COLUMN_WIDTH: u16 = 16;
+const USER_COLUMN_WIDTH: u16 = 16;
+const THREADS_COLUMN_WIDTH: u16 = 8;
 const CPU_COLUMN_WIDTH: u16 = 7;
 const MEMORY_COLUMN_WIDTH: u16 = 10;
 const COLUMN_SPACING: u16 = 1;
-const TABLE_BORDER_WIDTH: u16 = 2;
-const FIXED_COLUMN_WIDTH: u16 =
-    PID_COLUMN_WIDTH + NAME_COLUMN_WIDTH + CPU_COLUMN_WIDTH + MEMORY_COLUMN_WIDTH;
-const COLUMN_GAP_WIDTH: u16 = COLUMN_SPACING * 4;
 const MIN_BAR_CELLS: u16 = 6;
 const LABEL_WIDTH: usize = 8;
 const COLUMN_GAP: usize = 2;
@@ -66,20 +62,14 @@ pub fn render(frame: &mut Frame, app: &App) {
     );
     frame.render_widget(header, sections[0]);
 
-    let command_line_width = command_line_viewport_cells(area);
     let table = Table::new(
-        app.viewport_process_rows().into_iter().map(|row| {
-            process_row(
-                &row,
-                app.view_mode(),
-                app.selected_pid(),
-                app.command_line_offset_cells(),
-                command_line_width,
-            )
-        }),
+        app.viewport_process_rows()
+            .into_iter()
+            .map(|row| process_row(&row, app.view_mode())),
         [
             Constraint::Length(PID_COLUMN_WIDTH),
-            Constraint::Length(NAME_COLUMN_WIDTH),
+            Constraint::Length(USER_COLUMN_WIDTH),
+            Constraint::Length(THREADS_COLUMN_WIDTH),
             Constraint::Length(CPU_COLUMN_WIDTH),
             Constraint::Length(MEMORY_COLUMN_WIDTH),
             Constraint::Min(8),
@@ -88,7 +78,7 @@ pub fn render(frame: &mut Frame, app: &App) {
     .column_spacing(COLUMN_SPACING)
     .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED))
     .header(
-        Row::new(["PID", "NAME", "CPU", "MEMORY", "COMMAND LINE"]).style(
+        Row::new(["PID", "USER", "THREADS", "CPU", "MEMORY", "NAME"]).style(
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
@@ -143,17 +133,6 @@ fn header_height(area: Rect, app: &App) -> u16 {
         }
     };
     u16::try_from(content_height.saturating_add(2)).unwrap_or(u16::MAX)
-}
-
-/// Returns the command-line cell width after fixed columns, gaps, and table
-/// borders have been allocated.
-pub fn command_line_viewport_cells(area: Rect) -> u16 {
-    if terminal_is_too_small(area.width, area.height) {
-        0
-    } else {
-        area.width
-            .saturating_sub(TABLE_BORDER_WIDTH + FIXED_COLUMN_WIDTH + COLUMN_GAP_WIDTH)
-    }
 }
 
 fn render_minimum_size_message(frame: &mut Frame) {
@@ -424,35 +403,32 @@ fn render_sparkline(samples: &[HistorySample], width: usize) -> String {
     rendered
 }
 
-fn process_row(
-    row: &ProcessRow<'_>,
-    view_mode: ProcessViewMode,
-    selected_pid: Option<u32>,
-    selected_command_line_offset: u16,
-    command_line_width: u16,
-) -> Row<'static> {
+fn process_row(row: &ProcessRow<'_>, view_mode: ProcessViewMode) -> Row<'static> {
     let process = row.process;
-    let command_line_offset = if selected_pid == Some(process.pid) {
-        selected_command_line_offset
-    } else {
-        0
-    };
     Row::new(vec![
         Cell::from(process.pid.to_string()),
-        Cell::from(process_name(row, view_mode)),
+        Cell::from(process.user_display().to_owned()),
+        Cell::from(format_thread_count(&process.thread_count)),
         Cell::from(format_percent_value(process.cpu_percent)),
         Cell::from(format_bytes(process.memory_bytes)),
-        Cell::from(scroll_text(
-            &format_command_line(process),
-            command_line_offset,
-            command_line_width,
-        )),
+        Cell::from(process_name(row, view_mode)),
     ])
 }
 
 fn process_name(row: &ProcessRow<'_>, view_mode: ProcessViewMode) -> String {
     if view_mode == ProcessViewMode::Flat {
         return row.process.name.clone();
+    }
+
+    // Top-level processes have no parent relationship to draw. Starting their
+    // names directly preserves space for the hierarchy that follows.
+    if row.ancestor_has_next_siblings.is_empty() {
+        return if row.has_children {
+            let marker = if row.is_expanded { "▾ " } else { "▸ " };
+            format!("{marker}{}", row.process.name)
+        } else {
+            row.process.name.clone()
+        };
     }
 
     let ancestor_guides = row
@@ -526,6 +502,8 @@ fn sort_column_label(column: SortColumn) -> &'static str {
     match column {
         SortColumn::Pid => "PID",
         SortColumn::Name => "Name",
+        SortColumn::User => "User",
+        SortColumn::ThreadCount => "Threads",
         SortColumn::CpuPercent => "CPU",
         SortColumn::Memory => "Memory",
     }
@@ -546,6 +524,11 @@ fn snapshot_is_stale(snapshot: &Snapshot) -> bool {
         || metric_is_stale(&snapshot.system.commit_charge_bytes)
         || metric_is_stale(&snapshot.system.commit_limit_bytes)
         || metric_is_stale(&snapshot.processes)
+        || snapshot
+            .processes
+            .value
+            .iter()
+            .any(|process| metric_is_stale(&process.thread_count))
 }
 
 fn metric_is_stale<T>(metric: &Metric<T>) -> bool {
@@ -562,6 +545,10 @@ fn format_percent(metric: &Metric<f32>) -> String {
 
 fn format_metric_bytes(metric: &Metric<u64>) -> String {
     format!("{}{}", freshness_marker(metric), format_bytes(metric.value))
+}
+
+fn format_thread_count(metric: &Metric<u64>) -> String {
+    format!("{}{}", freshness_marker(metric), metric.value)
 }
 
 fn freshness_marker<T>(metric: &Metric<T>) -> &'static str {
@@ -589,23 +576,16 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
-fn format_command_line(process: &ProcessSnapshot) -> String {
-    process.command_line_display()
-}
-
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
     use super::{
-        MINIMUM_HEIGHT, MINIMUM_WIDTH, bar, chart_cell_budget, command_line_viewport_cells,
-        format_bytes, format_command_line, format_percent, header_lines, logical_cpu_grid_rows,
-        logical_cpu_lines, percentage, process_name, process_table_row_capacity, render_sparkline,
-        resource_readout, terminal_is_too_small,
+        MINIMUM_HEIGHT, MINIMUM_WIDTH, bar, chart_cell_budget, format_bytes, format_percent,
+        header_lines, logical_cpu_grid_rows, logical_cpu_lines, percentage, process_name,
+        process_table_row_capacity, render_sparkline, resource_readout, terminal_is_too_small,
     };
     use crate::app::{App, CpuDisplayMode, ProcessRow, ProcessViewMode};
     use crate::model::{
-        CommandLine, Freshness, HistorySample, Metric, ProcessSnapshot, SystemSnapshot,
+        CommandLine, Freshness, HistorySample, Metric, ProcessSnapshot, SystemSnapshot, UserSource,
     };
     use ratatui::layout::Rect;
     use ratatui::style::Color;
@@ -630,24 +610,6 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_command_lines_fall_back_to_the_executable_path() {
-        let process = ProcessSnapshot {
-            pid: 1,
-            parent_pid: None,
-            name: "example.exe".into(),
-            command_line: CommandLine::Unavailable,
-            executable_path: Some(PathBuf::from(r"C:\Tools\example.exe")),
-            cpu_percent: 0.0,
-            memory_bytes: 0,
-        };
-
-        assert_eq!(
-            format_command_line(&process),
-            r"<unavailable> C:\Tools\example.exe"
-        );
-    }
-
-    #[test]
     fn minimum_terminal_size_is_enforced_in_both_dimensions() {
         assert!(terminal_is_too_small(MINIMUM_WIDTH - 1, MINIMUM_HEIGHT));
         assert!(terminal_is_too_small(MINIMUM_WIDTH, MINIMUM_HEIGHT - 1));
@@ -657,20 +619,13 @@ mod tests {
     #[test]
     fn table_capacity_excludes_dashboard_and_table_chrome() {
         let app = App::new();
-        assert_eq!(process_table_row_capacity(Rect::new(0, 0, 80, 12), &app), 1);
-        assert_eq!(process_table_row_capacity(Rect::new(0, 0, 80, 11), &app), 0);
+        assert_eq!(process_table_row_capacity(Rect::new(0, 0, 64, 12), &app), 1);
+        assert_eq!(process_table_row_capacity(Rect::new(0, 0, 64, 11), &app), 0);
         assert_eq!(
-            process_table_row_capacity(Rect::new(0, 0, 80, 24), &app),
+            process_table_row_capacity(Rect::new(0, 0, 64, 24), &app),
             13
         );
-        assert_eq!(process_table_row_capacity(Rect::new(0, 0, 59, 24), &app), 0);
-    }
-
-    #[test]
-    fn command_line_viewport_leaves_the_fixed_columns_in_place() {
-        assert_eq!(command_line_viewport_cells(Rect::new(0, 0, 60, 12)), 14);
-        assert_eq!(command_line_viewport_cells(Rect::new(0, 0, 100, 24)), 54);
-        assert_eq!(command_line_viewport_cells(Rect::new(0, 0, 59, 24)), 0);
+        assert_eq!(process_table_row_capacity(Rect::new(0, 0, 63, 24), &app), 0);
     }
 
     #[test]
@@ -775,9 +730,12 @@ mod tests {
             pid: 1,
             parent_pid: None,
             name: "worker.exe".into(),
+            user: None,
+            user_source: UserSource::Token,
             command_line: CommandLine::NotRequested,
             executable_path: None,
             cpu_percent: 0.0,
+            thread_count: Metric::fresh(0),
             memory_bytes: 0,
         };
         let branch = ProcessRow {
@@ -795,10 +753,7 @@ mod tests {
             is_expanded: false,
         };
 
-        assert_eq!(
-            process_name(&branch, ProcessViewMode::Tree),
-            "├─▾ worker.exe"
-        );
+        assert_eq!(process_name(&branch, ProcessViewMode::Tree), "▾ worker.exe");
         assert_eq!(
             process_name(&leaf, ProcessViewMode::Tree),
             "│       └── worker.exe"
