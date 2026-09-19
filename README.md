@@ -1,29 +1,35 @@
 # wtop
 
-> An htop-inspired system monitor for Windows terminals.
+> An interactive, htop-inspired system monitor for Windows terminals.
 
-`wtop` provides a fast, full-screen view of running processes and system
-resource usage from PowerShell or Windows Terminal. Navigate the process list,
-inspect parent/child relationships, filter and sort live data, and manage a
-selected process without leaving the command line.
+`wtop` brings a live process list and system-resource dashboard to PowerShell
+and Windows Terminal. Inspect CPU, memory, commit, network, and GPU activity;
+navigate process hierarchies; and filter, sort, or safely terminate processes
+without leaving the command line.
 
-## Highlights
+---
 
-- Live CPU, memory, Windows commit, network, GPU, and process monitoring.
-- Sortable and filterable process table with PID, user, thread count, CPU, and
-  memory usage.
-- Flat and collapsible tree views for process hierarchies.
-- Logical CPU meters and aggregate CPU history views.
+![wtop running in Windows Terminal](assets/wtop-demo.gif)
+
+---
+
+## Features
+
+- Live CPU, physical memory, Windows commit, network, GPU, and process data.
+- Sortable, filterable process table with PID, user, thread count, CPU, memory,
+  and process-name columns.
+- Flat and collapsible parent/child process trees.
+- Toggle between logical CPU meters and aggregate CPU history.
 - Per-adapter GPU overview and detail panes when Windows exposes the counters.
-- Eleven built-in color themes, with live preview from the terminal UI.
-- Careful terminal cleanup, resize handling, and guarded process termination.
+- Eleven built-in color themes with live preview.
+- Safe terminal cleanup, resize handling, and confirmed process termination.
 
 ## Quick start
 
-### Prerequisites
+### Requirements
 
-- Windows with PowerShell or Windows Terminal.
-- The current stable Rust toolchain from [rustup](https://rustup.rs/).
+- Windows with PowerShell or Windows Terminal
+- The current stable Rust toolchain from [rustup](https://rustup.rs/)
 
 ### Run from a checkout
 
@@ -38,45 +44,42 @@ cargo install --path .
 wtop
 ```
 
-Ensure Cargo's bin directory is available on your `PATH` before running the
-installed command.
+Make sure Cargo's bin directory is on your `PATH` before running the installed
+command.
 
-## Controls
+## Keyboard controls
 
 | Key | Action |
 | --- | --- |
-| `Up` / `Down` | Move the selected process |
+| `Up` / `Down` | Select the previous or next process |
 | `Ctrl+Up` / `Ctrl+Down` | Move by one visible page |
-| `Ctrl+Left` / `Ctrl+Right` | Select the first / last visible process |
-| `c` | Switch between logical CPU meters and total CPU history |
-| `g` | Cycle GPU overview and individual adapter panes |
+| `Ctrl+Left` / `Ctrl+Right` | Select the first or last process |
+| `c` | Toggle logical CPU meters and CPU history |
+| `g` | Cycle GPU overview and adapter panes |
 | `t` | Toggle flat and tree process views |
-| `Enter` or `Space` | Expand or collapse the selected node in tree view |
-| `o` | Open Themes; use `Up`/`Down` to preview, `Enter` to apply, or `Esc` to cancel |
-| `?` or `h` | Open Help; dismiss with `?`, `h`, `Enter`, or `Esc` |
+| `Enter` / `Space` | Expand or collapse the selected tree node |
+| `/` | Edit the live filter (`Ctrl+U` clears it) |
 | `s` / `S` | Cycle the sort column / reverse its direction |
-| `/` | Edit a live filter (`Ctrl+U` clears it) |
+| `o` | Open Themes; preview with `Up`/`Down` |
 | `x` | Request termination of the selected process; confirm with `y` |
+| `?` or `h` | Open Help |
 | `q` or `Ctrl+C` | Quit |
 
-The Themes menu includes Default, Monochromatic, Black on White, Light
-Terminal, MC, Black Night, Broken Gray, Nord, Ocean, Evergreen, and Dusk.
-Theme selection applies to the current session.
+Themes include Default, Monochromatic, Black on White, Light Terminal, MC,
+Black Night, Broken Gray, Nord, Ocean, Evergreen, and Dusk. Theme selection is
+currently per session.
 
 ## Notes
 
-`Mem` is physical memory used versus total memory. `Commit` is Windows commit
-charge versus its limit, rather than a Linux-style swap measurement.
+`Mem` is physical memory used versus total memory. `Commit` is the Windows
+commit charge versus its limit, not Linux-style swap usage.
 
-Windows protects some system and elevated processes. Command lines, owner
-information, GPU counters, and termination permissions are therefore
-best-effort; unavailable values are shown as unavailable rather than zero.
-`wtop` always asks for confirmation before requesting termination and refuses
-to target PID 0, PID 4, or itself.
+Windows protects some system and elevated processes. Process command lines,
+owner information, GPU counters, and termination permissions are best-effort;
+unavailable values are not presented as zero. wtop requires confirmation before
+requesting termination and will not target PID 0, PID 4, or itself.
 
 ## Development
-
-Run the standard checks before contributing:
 
 ```powershell
 cargo fmt --check

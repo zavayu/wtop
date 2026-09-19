@@ -1128,7 +1128,7 @@ fn format_percent_value(value: f32) -> String {
 }
 
 fn format_bytes(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
 
     let mut value = bytes as f64;
     let mut unit_index = 0;
@@ -1197,8 +1197,8 @@ mod tests {
     #[test]
     fn byte_values_use_compact_binary_units() {
         assert_eq!(format_bytes(42), "42B");
-        assert_eq!(format_bytes(1_024), "1.0KiB");
-        assert_eq!(format_bytes(3 * 1024 * 1024 * 1024), "3.0GiB");
+        assert_eq!(format_bytes(1_024), "1.0KB");
+        assert_eq!(format_bytes(3 * 1024 * 1024 * 1024), "3.0GB");
     }
 
     #[test]
