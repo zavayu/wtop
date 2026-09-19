@@ -3,7 +3,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Wrap},
+    widgets::{Block, Borders, Cell, Clear, Padding, Paragraph, Row, Table, TableState, Wrap},
 };
 
 use crate::{
@@ -28,6 +28,7 @@ const COLUMN_GAP: usize = 2;
 const MIN_LOGICAL_CPU_METER_WIDTH: usize = 24;
 const LOGICAL_CPU_COLUMN_GAP: usize = 4;
 const BAR_TICK: char = '|';
+const HISTORY_TICKS: [char; 9] = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
 const MAX_CPU_HISTORY_ROWS: usize = 8;
 const MIN_CPU_HISTORY_ROWS: usize = 6;
 const MIN_PROCESS_ROWS: u16 = 1;
@@ -163,6 +164,9 @@ pub fn render(frame: &mut Frame, app: &App) {
     if let Some(selected_theme) = app.theme_menu_selection() {
         render_theme_menu(frame, selected_theme, palette);
     }
+    if app.is_help_open() {
+        render_help_menu(frame, palette);
+    }
 }
 
 fn terminal_is_too_small(width: u16, height: u16) -> bool {
@@ -187,33 +191,34 @@ pub fn process_table_row_capacity(area: Rect, app: &App) -> usize {
 }
 
 fn cpu_pane_height(area: Rect, app: &App) -> u16 {
-    let inner_width = usize::from(area.width.saturating_sub(2));
-    let content_height = match app.cpu_display_mode() {
-        CpuDisplayMode::Summary => {
-            let history_rows = cpu_history_rows(area, app);
-            if history_rows == 0 {
-                1
-            } else {
-                history_rows + 1
-            }
-        }
-        CpuDisplayMode::LogicalCpus => {
-            let cpu_count = app
-                .snapshot()
-                .map(|snapshot| snapshot.system.logical_cpu_percentages.value.len())
-                .unwrap_or(0);
-            logical_cpu_grid_rows(cpu_count, inner_width)
-        }
-    };
+    let content_height = cpu_content_height(area, app);
     u16::try_from(content_height.saturating_add(2)).unwrap_or(u16::MAX)
+}
+
+fn cpu_content_height(area: Rect, app: &App) -> usize {
+    let inner_width = usize::from(area.width.saturating_sub(2));
+    let minimum_history_content_height = if available_cpu_history_rows(area) == 0 {
+        1
+    } else {
+        MIN_CPU_HISTORY_ROWS + 1 // Graph rows plus the time axis.
+    };
+    let cpu_count = app
+        .snapshot()
+        .map(|snapshot| snapshot.system.logical_cpu_percentages.value.len())
+        .unwrap_or(0);
+    let logical_content_height = logical_cpu_grid_rows(cpu_count, inner_width);
+    // Preserve the original logical-CPU layout above a readable history
+    // minimum. Toggling never moves the process table or footer.
+    logical_content_height.max(minimum_history_content_height)
 }
 
 /// Uses a larger graph only when doing so leaves at least one process row.
 /// A compact summary is more useful than a tall dashboard with no table.
 fn cpu_history_rows(area: Rect, app: &App) -> usize {
-    if app.cpu_display_mode() != CpuDisplayMode::Summary {
-        return 0;
-    }
+    available_cpu_history_rows(area).min(cpu_content_height(area, app).saturating_sub(1))
+}
+
+fn available_cpu_history_rows(area: Rect) -> usize {
     let reserved_height = resource_pane_height(area.width)
         .saturating_add(FOOTER_HEIGHT)
         .saturating_add(TABLE_CHROME_HEIGHT)
@@ -334,7 +339,7 @@ fn render_theme_menu(frame: &mut Frame, selected_theme: Theme, palette: Palette)
         .block(
             Block::default()
                 .title(" Themes ")
-                .title_bottom(" Up/Down preview  Enter apply  Esc cancel ")
+                .title_bottom(" [↑/↓] preview  [Enter] apply")
                 .borders(Borders::ALL)
                 .style(
                     Style::default()
@@ -343,6 +348,71 @@ fn render_theme_menu(frame: &mut Frame, selected_theme: Theme, palette: Palette)
                 )
                 .border_style(Style::default().fg(palette.accent)),
         );
+    frame.render_widget(Clear, dialog_area);
+    frame.render_widget(dialog, dialog_area);
+}
+
+fn render_help_menu(frame: &mut Frame, palette: Palette) {
+    let area = frame.area();
+    let width = area.width.min(74);
+    let height = area.height.min(22);
+    let dialog_area = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    let heading = |text| {
+        Line::from(Span::styled(
+            text,
+            Style::default()
+                .fg(palette.accent)
+                .add_modifier(Modifier::BOLD),
+        ))
+    };
+    let lines = vec![
+        heading(" Navigation"),
+        Line::from("   ↑ / ↓             Previous / next process"),
+        Line::from("   Ctrl + ↑ / ↓        Move by one visible page"),
+        Line::from("   Ctrl + ← / →        First / last process"),
+        heading(" Views"),
+        Line::from("   c                 Toggle CPU history / logical CPU meters"),
+        Line::from("   g                 Cycle GPU overview / adapter panes"),
+        Line::from("   t                 Toggle flat and tree process views"),
+        Line::from("   Enter / Space     Expand or collapse a tree node"),
+        heading(" Data and appearance"),
+        Line::from("   s / S             Cycle the sort column / reverse it"),
+        Line::from("   /, Ctrl+U         Edit a live filter / clear it"),
+        Line::from("   o                 Choose a color theme"),
+        heading(" Actions"),
+        Line::from("   x                 Request termination (confirm with y)"),
+        heading(" General"),
+        Line::from("   ? / h             Show this help"),
+        Line::from("   q / Ctrl+C        Quit wtop"),
+        heading(" Notes"),
+        Line::from("   Mem: physical memory. Commit: Windows commit."),
+        Line::from("   Protected processes may hide details or deny termination."),
+    ];
+    let dialog = Paragraph::new(lines)
+        .style(
+            Style::default()
+                .fg(palette.foreground)
+                .bg(palette.background),
+        )
+        .block(
+            Block::default()
+                .title(" Help ")
+                .title_bottom(" ? / Esc to close ")
+                .borders(Borders::ALL)
+                .padding(Padding::horizontal(1))
+                .style(
+                    Style::default()
+                        .fg(palette.foreground)
+                        .bg(palette.background),
+                )
+                .border_style(Style::default().fg(palette.accent)),
+        )
+        .wrap(Wrap { trim: true });
     frame.render_widget(Clear, dialog_area);
     frame.render_widget(dialog, dialog_area);
 }
@@ -413,11 +483,21 @@ fn cpu_history_lines(
                 let Some(sample) = sample else {
                     return Span::raw(" ");
                 };
-                let filled_rows = ((sample.cpu_percent.clamp(0.0, 100.0) / 100.0) * height as f32)
-                    .round() as usize;
-                if filled_rows >= level {
+                let fraction = sample.cpu_percent.clamp(0.0, 100.0) / 100.0;
+                // Each graph cell has eight Unicode block sub-levels. This
+                // keeps low nonzero samples visible without flattening them
+                // into the same one-row marker.
+                let filled_subrows = if fraction > 0.0 {
+                    (fraction * (height * 8) as f32).ceil() as usize
+                } else {
+                    0
+                };
+                let row_start = (level - 1) * 8;
+                let filled_in_row = filled_subrows.saturating_sub(row_start).min(8);
+                let tick = HISTORY_TICKS[filled_in_row];
+                if tick != ' ' {
                     Span::styled(
-                        BAR_TICK.to_string(),
+                        tick.to_string(),
                         Style::default()
                             .fg(usage_color(f64::from(sample.cpu_percent) / 100.0, palette)),
                     )
@@ -935,29 +1015,24 @@ fn footer_text(app: &App) -> String {
         ""
     };
 
-    let status_prefix = app
-        .status_message()
-        .map(|message| format!("{message}  "))
-        .unwrap_or_default();
-
     if app.is_filter_editing() {
         format!(
-            "{stale_prefix}{status_prefix}/{}  Enter apply  Esc cancel  Ctrl+U clear",
+            "{stale_prefix}/{}  [Enter] apply  [Esc] cancel  [Ctrl+U] clear",
             app.filter()
         )
+    } else if let Some(message) = app.status_message() {
+        format!("{stale_prefix}{message}  [?] Help  [q] Quit")
     } else if app.filter().is_empty() {
         if app.view_mode() == ProcessViewMode::Tree {
             format!(
-                "{stale_prefix}{status_prefix}c CPU  g GPU  t Flat  o Theme  x Kill  s Sort  / Filter  q Quit"
+                "{stale_prefix}[↑/↓] Select  [Enter] Node  [/] Filter  [t] Flat  [?] Help  [q] Quit"
             )
         } else {
-            format!(
-                "{stale_prefix}{status_prefix}c CPU  g GPU  t Tree  o Theme  x Kill  s Sort  S Reverse  / Filter  q Quit"
-            )
+            format!("{stale_prefix}[↑/↓] Select  [/] Filter  [t] Tree  [?] Help  [q] Quit")
         }
     } else {
         format!(
-            "{stale_prefix}{status_prefix}Filter: {}  c CPU  g GPU  t View  o Theme  x Kill  s Sort  S Reverse  / Edit  q Quit",
+            "{stale_prefix}Filter: {}  [↑/↓] Select  [/] Edit  [t] View  [?] Help  [q] Quit",
             app.filter()
         )
     }
@@ -1102,16 +1177,18 @@ fn optional_memory_readout(used: &Metric<Option<u64>>, capacity: &Metric<Option<
 
 #[cfg(test)]
 mod tests {
+    use std::{sync::Arc, time::Instant};
+
     use super::{
         MINIMUM_HEIGHT, MINIMUM_WIDTH, bar, chart_cell_budget, cpu_history_lines, cpu_history_rows,
-        cpu_lines, format_bytes, format_percent, logical_cpu_grid_rows, logical_cpu_lines,
-        percentage, process_name, process_table_row_capacity, resource_readout,
+        cpu_lines, cpu_pane_height, format_bytes, format_percent, logical_cpu_grid_rows,
+        logical_cpu_lines, percentage, process_name, process_table_row_capacity, resource_readout,
         terminal_is_too_small,
     };
     use crate::app::{App, CpuDisplayMode, ProcessRow, ProcessViewMode};
     use crate::model::{
         CommandLine, Freshness, History, HistorySample, Metric, NetworkSnapshot, ProcessSnapshot,
-        SystemSnapshot, UserSource,
+        Snapshot, SystemSnapshot, UserSource,
     };
     use crate::theme::Theme;
     use ratatui::layout::Rect;
@@ -1155,11 +1232,39 @@ mod tests {
 
     #[test]
     fn cpu_history_grows_only_when_the_process_table_keeps_a_row() {
-        let mut app = App::new();
-        app.toggle_cpu_display_mode();
+        let app = App::new();
         assert_eq!(cpu_history_rows(Rect::new(0, 0, 64, 26), &app), 0);
         assert_eq!(cpu_history_rows(Rect::new(0, 0, 64, 28), &app), 6);
-        assert_eq!(cpu_history_rows(Rect::new(0, 0, 64, 30), &app), 8);
+        assert_eq!(cpu_history_rows(Rect::new(0, 0, 64, 30), &app), 6);
+    }
+
+    #[test]
+    fn cpu_presentations_reserve_the_same_pane_height() {
+        let system = SystemSnapshot {
+            cpu_percent: Metric::fresh(0.0),
+            logical_cpu_percentages: Metric::fresh(vec![0.0; 16]),
+            total_memory_bytes: Metric::fresh(0),
+            used_memory_bytes: Metric::fresh(0),
+            commit_charge_bytes: Metric::fresh(0),
+            commit_limit_bytes: Metric::fresh(0),
+            network: NetworkSnapshot::default(),
+            gpu: Default::default(),
+        };
+        let snapshot = Snapshot {
+            generation: 1,
+            collected_at: Instant::now(),
+            system,
+            processes: Metric::fresh(Vec::new()),
+            history: Default::default(),
+        };
+        let mut app = App::new();
+        app.set_snapshot(Arc::new(snapshot));
+        let area = Rect::new(0, 0, 100, 40);
+        let logical_cpu_height = cpu_pane_height(area, &app);
+
+        app.toggle_cpu_display_mode();
+
+        assert_eq!(cpu_pane_height(area, &app), logical_cpu_height);
     }
 
     #[test]
@@ -1175,13 +1280,34 @@ mod tests {
             .iter()
             .map(|span| span.content.as_ref())
             .collect::<String>();
-        assert_eq!(top_row, "    |");
+        assert_eq!(top_row, "    █");
         let bottom_row = lines[3]
             .spans
             .iter()
             .map(|span| span.content.as_ref())
             .collect::<String>();
-        assert_eq!(bottom_row, "|||||");
+        assert_eq!(bottom_row, "█████");
+    }
+
+    #[test]
+    fn cpu_history_distinguishes_low_nonzero_samples() {
+        let mut history = History::with_capacity(3);
+        history.push(history_sample(0.0));
+        history.push(history_sample(3.0));
+        history.push(history_sample(10.0));
+
+        let lines = cpu_history_lines(Some(&history), 3, 8, Theme::Default.palette());
+        let bottom_row = lines[7]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert_eq!(bottom_row, " ▂▇");
+        assert!(lines[..7].iter().all(|line| {
+            line.spans
+                .iter()
+                .all(|span| span.content.as_ref().trim().is_empty())
+        }));
     }
 
     #[test]

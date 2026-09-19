@@ -51,7 +51,9 @@ installed command.
 | `c` | Switch between logical CPU meters and total CPU history |
 | `g` | Cycle GPU overview and individual adapter panes |
 | `t` | Toggle flat and tree process views |
+| `Enter` or `Space` | Expand or collapse the selected node in tree view |
 | `o` | Open Themes; use `Up`/`Down` to preview, `Enter` to apply, or `Esc` to cancel |
+| `?` or `h` | Open Help; dismiss with `?`, `h`, `Enter`, or `Esc` |
 | `s` / `S` | Cycle the sort column / reverse its direction |
 | `/` | Edit a live filter (`Ctrl+U` clears it) |
 | `x` | Request termination of the selected process; confirm with `y` |

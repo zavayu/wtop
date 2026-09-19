@@ -56,13 +56,10 @@ fn run() -> Result<(), Box<dyn Error>> {
                     app.handle_key_with_modifiers(key.code, key.modifiers);
                     if let Some(target) = app.take_termination_request() {
                         match terminate_process(target.pid) {
-                            Ok(()) => app.set_status_message(format!(
-                                "Termination requested for {} ({})",
-                                target.name, target.pid
-                            )),
+                            Ok(()) => {}
                             Err(error) => app.set_status_message(format!(
-                                "Could not terminate {} ({}): {error}",
-                                target.name, target.pid
+                                "Could not terminate {}: {error}",
+                                target.name
                             )),
                         }
                     }

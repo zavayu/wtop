@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 use crossterm::event::{KeyCode, KeyModifiers};
@@ -27,11 +28,21 @@ pub struct App {
     sort: SortSpec,
     filter: String,
     filter_before_edit: Option<String>,
+    collapsed_tree_pids: HashSet<u32>,
     theme: Theme,
     theme_before_menu: Option<Theme>,
+    help_open: bool,
     termination_confirmation: Option<TerminationTarget>,
     termination_request: Option<TerminationTarget>,
-    status_message: Option<String>,
+    status_message: Option<StatusMessage>,
+}
+
+const STATUS_MESSAGE_DURATION: Duration = Duration::from_secs(5);
+
+#[derive(Debug)]
+struct StatusMessage {
+    text: String,
+    expires_at: Instant,
 }
 
 /// The supported sort keys for the first milestone's process table.
@@ -245,6 +256,10 @@ impl App {
         self.theme_before_menu.map(|_| self.theme)
     }
 
+    pub fn is_help_open(&self) -> bool {
+        self.help_open
+    }
+
     pub fn termination_confirmation(&self) -> Option<&TerminationTarget> {
         self.termination_confirmation.as_ref()
     }
@@ -254,11 +269,17 @@ impl App {
     }
 
     pub fn status_message(&self) -> Option<&str> {
-        self.status_message.as_deref()
+        self.status_message
+            .as_ref()
+            .filter(|message| Instant::now() < message.expires_at)
+            .map(|message| message.text.as_str())
     }
 
     pub fn set_status_message(&mut self, message: impl Into<String>) {
-        self.status_message = Some(message.into());
+        self.status_message = Some(StatusMessage {
+            text: message.into(),
+            expires_at: Instant::now() + STATUS_MESSAGE_DURATION,
+        });
     }
 
     pub fn set_filter(&mut self, filter: impl Into<String>) {
@@ -280,6 +301,10 @@ impl App {
         }
         if self.is_filter_editing() {
             self.handle_filter_key(key, modifiers);
+            return;
+        }
+        if self.is_help_open() {
+            self.handle_help_key(key);
             return;
         }
         if modifiers.contains(KeyModifiers::CONTROL) {
@@ -313,8 +338,10 @@ impl App {
             KeyCode::Char('c') => self.toggle_cpu_display_mode(),
             KeyCode::Char('g') => self.cycle_gpu_display(),
             KeyCode::Char('o') => self.open_theme_menu(),
+            KeyCode::Char('?') | KeyCode::Char('h') => self.help_open = true,
             KeyCode::Char('x') => self.request_termination(),
             KeyCode::Char('/') => self.begin_filter_edit(),
+            KeyCode::Enter | KeyCode::Char(' ') => self.toggle_selected_tree_node(),
             KeyCode::Up => self.move_selection_by(-1),
             KeyCode::Down => self.move_selection_by(1),
             _ => {}
@@ -337,6 +364,37 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    fn handle_help_key(&mut self, key: KeyCode) {
+        if matches!(
+            key,
+            KeyCode::Char('?' | 'h') | KeyCode::Enter | KeyCode::Esc
+        ) {
+            self.help_open = false;
+        }
+    }
+
+    fn toggle_selected_tree_node(&mut self) {
+        if self.view_mode != ProcessViewMode::Tree {
+            return;
+        }
+        let Some(selected_pid) = self.selected_pid else {
+            return;
+        };
+        let has_children = self
+            .visible_rows()
+            .into_iter()
+            .any(|row| row.process.pid == selected_pid && row.has_children);
+        if !has_children {
+            return;
+        }
+
+        let previous_index = self.selected_index();
+        if !self.collapsed_tree_pids.insert(selected_pid) {
+            self.collapsed_tree_pids.remove(&selected_pid);
+        }
+        self.reconcile_selection(previous_index);
     }
 
     fn apply_filter(&mut self, filter: String) {
@@ -372,7 +430,6 @@ impl App {
             }
             KeyCode::Char('n' | 'N') | KeyCode::Esc => {
                 self.termination_confirmation = None;
-                self.set_status_message("Termination cancelled");
             }
             _ => {}
         }
@@ -466,7 +523,12 @@ impl App {
                     })
                     .collect()
             }
-            ProcessViewMode::Tree => tree_rows(&snapshot.processes.value, &filter, self.sort),
+            ProcessViewMode::Tree => tree_rows(
+                &snapshot.processes.value,
+                &filter,
+                self.sort,
+                &self.collapsed_tree_pids,
+            ),
         }
     }
 
@@ -612,6 +674,7 @@ fn tree_rows<'a>(
     processes: &'a [ProcessSnapshot],
     lowercase_filter: &str,
     sort: SortSpec,
+    collapsed_pids: &HashSet<u32>,
 ) -> Vec<ProcessRow<'a>> {
     let processes_by_pid = processes
         .iter()
@@ -653,6 +716,8 @@ fn tree_rows<'a>(
             &processes_by_pid,
             &child_pids,
             &included_pids,
+            collapsed_pids,
+            lowercase_filter.is_empty(),
             &mut visited_pids,
             &mut rows,
         );
@@ -737,6 +802,8 @@ fn append_tree_rows<'a>(
     processes_by_pid: &HashMap<u32, &'a ProcessSnapshot>,
     child_pids: &HashMap<u32, Vec<u32>>,
     included_pids: &HashSet<u32>,
+    collapsed_pids: &HashSet<u32>,
+    collapse_nodes: bool,
     visited_pids: &mut HashSet<u32>,
     rows: &mut Vec<ProcessRow<'a>>,
 ) {
@@ -765,7 +832,7 @@ fn append_tree_rows<'a>(
         has_children,
     });
 
-    if has_children {
+    if has_children && (!collapse_nodes || !collapsed_pids.contains(&pid)) {
         let mut child_ancestor_has_next_siblings = ancestor_has_next_siblings.to_vec();
         child_ancestor_has_next_siblings.push(!is_last_sibling);
         let child_count = visible_children.len();
@@ -777,6 +844,8 @@ fn append_tree_rows<'a>(
                 processes_by_pid,
                 child_pids,
                 included_pids,
+                collapsed_pids,
+                collapse_nodes,
                 visited_pids,
                 rows,
             );
@@ -848,10 +917,14 @@ fn process_matches_filter(process: &ProcessSnapshot, lowercase_filter: &str) -> 
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, time::Instant};
+    use std::{
+        sync::Arc,
+        time::{Duration, Instant},
+    };
 
     use super::{
         App, CpuDisplayMode, GpuDisplayMode, ProcessViewMode, SortColumn, SortDirection, SortSpec,
+        StatusMessage,
     };
     use crate::model::{
         CommandLine, GpuAdapterSnapshot, Metric, ProcessSnapshot, Snapshot, SystemSnapshot,
@@ -980,6 +1053,17 @@ mod tests {
     }
 
     #[test]
+    fn expired_status_messages_are_not_rendered() {
+        let mut app = App::new();
+        app.status_message = Some(StatusMessage {
+            text: "An old error".into(),
+            expires_at: Instant::now() - Duration::from_secs(1),
+        });
+
+        assert_eq!(app.status_message(), None);
+    }
+
+    #[test]
     fn c_toggles_between_summary_and_logical_cpu_header_modes() {
         let mut app = App::new();
         assert_eq!(app.cpu_display_mode(), CpuDisplayMode::LogicalCpus);
@@ -1013,6 +1097,26 @@ mod tests {
         app.handle_key(KeyCode::Enter);
         assert!(!app.is_theme_menu_open());
         assert_eq!(app.theme(), Theme::Monochromatic);
+    }
+
+    #[test]
+    fn help_menu_blocks_other_shortcuts_until_it_is_dismissed() {
+        let mut app = App::new();
+
+        app.handle_key(KeyCode::Char('?'));
+        assert!(app.is_help_open());
+        app.handle_key(KeyCode::Char('q'));
+        assert!(app.is_help_open());
+        assert!(!app.should_quit());
+
+        app.handle_key(KeyCode::Esc);
+        assert!(!app.is_help_open());
+        assert!(!app.should_quit());
+
+        app.handle_key(KeyCode::Char('h'));
+        assert!(app.is_help_open());
+        app.handle_key(KeyCode::Enter);
+        assert!(!app.is_help_open());
     }
 
     #[test]
@@ -1384,6 +1488,36 @@ mod tests {
                 .map(|row| (row.process.pid, row.ancestor_has_next_siblings.len()))
                 .collect::<Vec<_>>(),
             vec![(1, 0), (2, 1), (4, 2), (3, 1), (5, 0)]
+        );
+    }
+
+    #[test]
+    fn tree_nodes_expand_and_collapse_without_changing_their_connectors() {
+        let mut app = App::new();
+        app.set_snapshot(snapshot(vec![
+            process_with_parent(1, None, "root.exe"),
+            process_with_parent(2, Some(1), "child.exe"),
+            process_with_parent(3, Some(2), "grandchild.exe"),
+            process_with_parent(4, None, "other-root.exe"),
+        ]));
+        app.toggle_view_mode();
+
+        app.handle_key(KeyCode::Enter);
+        assert_eq!(
+            app.visible_processes()
+                .into_iter()
+                .map(|process| process.pid)
+                .collect::<Vec<_>>(),
+            vec![1, 4]
+        );
+
+        app.handle_key(KeyCode::Char(' '));
+        assert_eq!(
+            app.visible_processes()
+                .into_iter()
+                .map(|process| process.pid)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4]
         );
     }
 
