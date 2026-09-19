@@ -4,6 +4,7 @@ pub mod model;
 mod process_control;
 mod terminal;
 pub mod text;
+pub mod theme;
 mod ui;
 pub mod worker;
 

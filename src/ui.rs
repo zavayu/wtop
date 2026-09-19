@@ -11,6 +11,7 @@ use crate::{
         App, CpuDisplayMode, GpuDisplayMode, ProcessRow, ProcessViewMode, SortColumn, SortDirection,
     },
     model::{Freshness, History, Metric, Snapshot, SystemSnapshot},
+    theme::{Palette, Theme},
 };
 
 const MINIMUM_WIDTH: u16 = 64;
@@ -36,8 +37,17 @@ const TABLE_CHROME_HEIGHT: u16 = 3;
 /// Renders the first-milestone dashboard from the newest completed snapshot.
 pub fn render(frame: &mut Frame, app: &App) {
     let area = frame.area();
+    let palette = app.theme().palette();
+    frame.render_widget(
+        Block::default().style(
+            Style::default()
+                .fg(palette.foreground)
+                .bg(palette.background),
+        ),
+        area,
+    );
     if terminal_is_too_small(area.width, area.height) {
-        render_minimum_size_message(frame);
+        render_minimum_size_message(frame, palette);
         return;
     }
 
@@ -61,6 +71,7 @@ pub fn render(frame: &mut Frame, app: &App) {
         usize::from(inner_width),
         app.cpu_display_mode(),
         history_rows,
+        palette,
     ))
     .alignment(Alignment::Left)
     .block(
@@ -69,10 +80,15 @@ pub fn render(frame: &mut Frame, app: &App) {
                 app.snapshot().map(|snapshot| &snapshot.system),
             ))
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan)),
+            .style(
+                Style::default()
+                    .fg(palette.foreground)
+                    .bg(palette.background),
+            )
+            .border_style(Style::default().fg(palette.accent)),
     );
     frame.render_widget(cpu, sections[0]);
-    render_resource_panes(frame, sections[1], app);
+    render_resource_panes(frame, sections[1], app, palette);
 
     let table = Table::new(
         app.viewport_process_rows()
@@ -88,18 +104,34 @@ pub fn render(frame: &mut Frame, app: &App) {
         ],
     )
     .column_spacing(COLUMN_SPACING)
-    .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+    .style(
+        Style::default()
+            .fg(palette.foreground)
+            .bg(palette.background),
+    )
+    .row_highlight_style(
+        Style::default()
+            .fg(palette.selection_foreground)
+            .bg(palette.selection_background)
+            .add_modifier(Modifier::BOLD),
+    )
     .header(
         Row::new(["PID", "USER", "THREADS", "CPU", "MEMORY", "NAME"]).style(
             Style::default()
-                .fg(Color::Cyan)
+                .fg(palette.accent)
                 .add_modifier(Modifier::BOLD),
         ),
     )
     .block(
         Block::default()
             .borders(Borders::ALL)
-            .title(process_table_title(app)),
+            .title(process_table_title(app))
+            .style(
+                Style::default()
+                    .fg(palette.foreground)
+                    .bg(palette.background),
+            )
+            .border_style(Style::default().fg(palette.border)),
     );
     let mut table_state = TableState::default();
     table_state.select(app.selected_viewport_index());
@@ -108,11 +140,28 @@ pub fn render(frame: &mut Frame, app: &App) {
     let footer = Paragraph::new(footer_text(app))
         .alignment(Alignment::Center)
         .wrap(Wrap { trim: true })
-        .block(Block::default().borders(Borders::ALL));
+        .style(
+            Style::default()
+                .fg(palette.foreground)
+                .bg(palette.background),
+        )
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .style(
+                    Style::default()
+                        .fg(palette.foreground)
+                        .bg(palette.background),
+                )
+                .border_style(Style::default().fg(palette.border)),
+        );
     frame.render_widget(footer, sections[3]);
 
     if let Some(target) = app.termination_confirmation() {
-        render_termination_confirmation(frame, target.pid, &target.name);
+        render_termination_confirmation(frame, target.pid, &target.name, palette);
+    }
+    if let Some(selected_theme) = app.theme_menu_selection() {
+        render_theme_menu(frame, selected_theme, palette);
     }
 }
 
@@ -190,17 +239,32 @@ fn resource_pane_height(width: u16) -> u16 {
     }
 }
 
-fn render_minimum_size_message(frame: &mut Frame) {
+fn render_minimum_size_message(frame: &mut Frame, palette: Palette) {
     let message =
         format!("Terminal too small — minimum {MINIMUM_WIDTH} columns × {MINIMUM_HEIGHT} rows");
     let paragraph = Paragraph::new(message)
         .alignment(Alignment::Center)
         .wrap(Wrap { trim: true })
-        .block(Block::default().title(" wtop ").borders(Borders::ALL));
+        .style(
+            Style::default()
+                .fg(palette.foreground)
+                .bg(palette.background),
+        )
+        .block(
+            Block::default()
+                .title(" wtop ")
+                .borders(Borders::ALL)
+                .style(
+                    Style::default()
+                        .fg(palette.foreground)
+                        .bg(palette.background),
+                )
+                .border_style(Style::default().fg(palette.accent)),
+        );
     frame.render_widget(paragraph, frame.area());
 }
 
-fn render_termination_confirmation(frame: &mut Frame, pid: u32, name: &str) {
+fn render_termination_confirmation(frame: &mut Frame, pid: u32, name: &str, palette: Palette) {
     let area = frame.area();
     let width = area.width.min(52);
     let height = 7;
@@ -214,11 +278,70 @@ fn render_termination_confirmation(frame: &mut Frame, pid: u32, name: &str) {
     let dialog = Paragraph::new(prompt)
         .alignment(Alignment::Center)
         .wrap(Wrap { trim: true })
+        .style(
+            Style::default()
+                .fg(palette.foreground)
+                .bg(palette.background),
+        )
         .block(
             Block::default()
                 .title(" Confirm process termination ")
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Red)),
+                .style(
+                    Style::default()
+                        .fg(palette.foreground)
+                        .bg(palette.background),
+                )
+                .border_style(Style::default().fg(palette.critical)),
+        );
+    frame.render_widget(Clear, dialog_area);
+    frame.render_widget(dialog, dialog_area);
+}
+
+fn render_theme_menu(frame: &mut Frame, selected_theme: Theme, palette: Palette) {
+    let area = frame.area();
+    let width = area.width.min(34);
+    let height = 13;
+    let dialog_area = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    let lines = Theme::ALL
+        .iter()
+        .map(|theme| {
+            let marker = if *theme == selected_theme { '›' } else { ' ' };
+            let style = if *theme == selected_theme {
+                Style::default()
+                    .fg(palette.selection_foreground)
+                    .bg(palette.selection_background)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+                    .fg(palette.foreground)
+                    .bg(palette.background)
+            };
+            Line::from(Span::styled(format!(" {marker} {}", theme.label()), style))
+        })
+        .collect::<Vec<_>>();
+    let dialog = Paragraph::new(lines)
+        .style(
+            Style::default()
+                .fg(palette.foreground)
+                .bg(palette.background),
+        )
+        .block(
+            Block::default()
+                .title(" Themes ")
+                .title_bottom(" Up/Down preview  Enter apply  Esc cancel ")
+                .borders(Borders::ALL)
+                .style(
+                    Style::default()
+                        .fg(palette.foreground)
+                        .bg(palette.background),
+                )
+                .border_style(Style::default().fg(palette.accent)),
         );
     frame.render_widget(Clear, dialog_area);
     frame.render_widget(dialog, dialog_area);
@@ -239,6 +362,7 @@ fn cpu_lines(
     inner_width: usize,
     cpu_display_mode: CpuDisplayMode,
     history_rows: usize,
+    palette: Palette,
 ) -> Vec<Line<'static>> {
     let Some(system) = system else {
         return if cpu_display_mode == CpuDisplayMode::Summary {
@@ -256,21 +380,27 @@ fn cpu_lines(
 
     match cpu_display_mode {
         CpuDisplayMode::Summary if history_rows > 0 => {
-            cpu_history_lines(history, inner_width, history_rows)
+            cpu_history_lines(history, inner_width, history_rows, palette)
         }
         CpuDisplayMode::Summary => vec![resource_line(
             "CPU",
             &format_percent(&system.cpu_percent),
             display_width(&format_percent(&system.cpu_percent)),
             Vec::new(),
+            palette,
         )],
         CpuDisplayMode::LogicalCpus => {
-            logical_cpu_lines(&system.logical_cpu_percentages.value, inner_width)
+            logical_cpu_lines(&system.logical_cpu_percentages.value, inner_width, palette)
         }
     }
 }
 
-fn cpu_history_lines(history: Option<&History>, width: usize, height: usize) -> Vec<Line<'static>> {
+fn cpu_history_lines(
+    history: Option<&History>,
+    width: usize,
+    height: usize,
+    palette: Palette,
+) -> Vec<Line<'static>> {
     let samples = history
         .map(|history| history.samples().copied().collect::<Vec<_>>())
         .unwrap_or_default();
@@ -288,7 +418,8 @@ fn cpu_history_lines(history: Option<&History>, width: usize, height: usize) -> 
                 if filled_rows >= level {
                     Span::styled(
                         BAR_TICK.to_string(),
-                        Style::default().fg(usage_color(f64::from(sample.cpu_percent) / 100.0)),
+                        Style::default()
+                            .fg(usage_color(f64::from(sample.cpu_percent) / 100.0, palette)),
                     )
                 } else {
                     Span::raw(" ")
@@ -298,14 +429,14 @@ fn cpu_history_lines(history: Option<&History>, width: usize, height: usize) -> 
         })
         .collect::<Vec<_>>();
     lines.push(Line::from(vec![
-        Span::styled("60s ago", Style::default().fg(Color::DarkGray)),
+        Span::styled("60s ago", Style::default().fg(palette.muted)),
         Span::raw(" ".repeat(width.saturating_sub(10))),
-        Span::styled("now", Style::default().fg(Color::DarkGray)),
+        Span::styled("now", Style::default().fg(palette.muted)),
     ]));
     lines
 }
 
-fn render_resource_panes(frame: &mut Frame, area: Rect, app: &App) {
+fn render_resource_panes(frame: &mut Frame, area: Rect, app: &App, palette: Palette) {
     let system = app.snapshot().map(|snapshot| &snapshot.system);
     let panes = if area.width >= 110 {
         Layout::default()
@@ -338,12 +469,17 @@ fn render_resource_panes(frame: &mut Frame, area: Rect, app: &App) {
             .split(area)
             .to_vec()
     };
-    render_memory_pane(frame, panes[0], system);
-    render_gpu_pane(frame, panes[1], system, app.gpu_display_mode());
-    render_network_pane(frame, panes[2], system);
+    render_memory_pane(frame, panes[0], system, palette);
+    render_gpu_pane(frame, panes[1], system, app.gpu_display_mode(), palette);
+    render_network_pane(frame, panes[2], system, palette);
 }
 
-fn render_memory_pane(frame: &mut Frame, area: Rect, system: Option<&SystemSnapshot>) {
+fn render_memory_pane(
+    frame: &mut Frame,
+    area: Rect,
+    system: Option<&SystemSnapshot>,
+    palette: Palette,
+) {
     let lines = system.map_or_else(
         || vec![Line::from("RAM     -- / --"), Line::from("Commit  -- / --")],
         |system| {
@@ -360,7 +496,9 @@ fn render_memory_pane(frame: &mut Frame, area: Rect, system: Option<&SystemSnaps
                     bar(
                         percentage(&system.used_memory_bytes, &system.total_memory_bytes),
                         chart_width,
+                        palette,
                     ),
+                    palette,
                 ),
                 resource_line(
                     "Commit",
@@ -369,12 +507,14 @@ fn render_memory_pane(frame: &mut Frame, area: Rect, system: Option<&SystemSnaps
                     bar(
                         percentage(&system.commit_charge_bytes, &system.commit_limit_bytes),
                         chart_width,
+                        palette,
                     ),
+                    palette,
                 ),
             ]
         },
     );
-    frame.render_widget(resource_block(" Memory ", lines), area);
+    frame.render_widget(resource_block(" Memory ", lines, palette), area);
 }
 
 fn render_gpu_pane(
@@ -382,10 +522,15 @@ fn render_gpu_pane(
     area: Rect,
     system: Option<&SystemSnapshot>,
     display: GpuDisplayMode,
+    palette: Palette,
 ) {
     let Some(system) = system else {
         frame.render_widget(
-            resource_block(" GPU ", vec![Line::from("Collecting GPU adapters…")]),
+            resource_block(
+                " GPU ",
+                vec![Line::from("Collecting GPU adapters…")],
+                palette,
+            ),
             area,
         );
         return;
@@ -393,7 +538,11 @@ fn render_gpu_pane(
     let adapters = &system.gpu.adapters.value;
     if adapters.is_empty() {
         frame.render_widget(
-            resource_block(" GPU ", vec![Line::from("No hardware GPU detected")]),
+            resource_block(
+                " GPU ",
+                vec![Line::from("No hardware GPU detected")],
+                palette,
+            ),
             area,
         );
         return;
@@ -433,11 +582,13 @@ fn render_gpu_pane(
                         12,
                         &utilization,
                         display_width(&utilization),
-                        bar(usage, width),
+                        bar(usage, width, palette),
+                        palette,
                     ),
                     Line::from(format!("Dedicated  {dedicated}")),
                     Line::from(format!("Shared     {shared}")),
                 ],
+                palette,
             ),
             area,
         );
@@ -460,16 +611,22 @@ fn render_gpu_pane(
             )));
         }
         let title = format!(" GPU · {} adapters ", adapters.len());
-        frame.render_widget(resource_block(title, lines), area);
+        frame.render_widget(resource_block(title, lines, palette), area);
     }
 }
 
-fn render_network_pane(frame: &mut Frame, area: Rect, system: Option<&SystemSnapshot>) {
+fn render_network_pane(
+    frame: &mut Frame,
+    area: Rect,
+    system: Option<&SystemSnapshot>,
+    palette: Palette,
+) {
     let Some(system) = system else {
         frame.render_widget(
             resource_block(
                 " Network ",
                 vec![Line::from("Collecting interface counters…")],
+                palette,
             ),
             area,
         );
@@ -500,19 +657,30 @@ fn render_network_pane(frame: &mut Frame, area: Rect, system: Option<&SystemSnap
     if network.interfaces.value.is_empty() {
         lines.push(Line::from("No operational interfaces"));
     }
-    frame.render_widget(resource_block(" Network ", lines), area);
+    frame.render_widget(resource_block(" Network ", lines, palette), area);
 }
 
 fn resource_block(
     title: impl Into<Line<'static>>,
     lines: Vec<Line<'static>>,
+    palette: Palette,
 ) -> Paragraph<'static> {
     Paragraph::new(lines)
+        .style(
+            Style::default()
+                .fg(palette.foreground)
+                .bg(palette.background),
+        )
         .block(
             Block::default()
                 .title(title)
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::DarkGray)),
+                .style(
+                    Style::default()
+                        .fg(palette.foreground)
+                        .bg(palette.background),
+                )
+                .border_style(Style::default().fg(palette.border)),
         )
         .wrap(Wrap { trim: true })
 }
@@ -534,7 +702,11 @@ fn logical_cpu_grid_rows(cpu_count: usize, inner_width: usize) -> usize {
     cpu_count.div_ceil(columns).max(1)
 }
 
-fn logical_cpu_lines(percentages: &[f32], inner_width: usize) -> Vec<Line<'static>> {
+fn logical_cpu_lines(
+    percentages: &[f32],
+    inner_width: usize,
+    palette: Palette,
+) -> Vec<Line<'static>> {
     if percentages.is_empty() {
         return vec![Line::from("Logical CPUs  --")];
     }
@@ -554,6 +726,7 @@ fn logical_cpu_lines(percentages: &[f32], inner_width: usize) -> Vec<Line<'stati
                     row_index * columns + column_index,
                     *percent,
                     meter_width,
+                    palette,
                 ));
             }
             Line::from(spans)
@@ -573,7 +746,12 @@ fn logical_cpu_meter_width(inner_width: usize, columns: usize) -> usize {
     inner_width.saturating_sub(LOGICAL_CPU_COLUMN_GAP * columns.saturating_sub(1)) / columns
 }
 
-fn logical_cpu_meter(index: usize, percent: f32, width: usize) -> Vec<Span<'static>> {
+fn logical_cpu_meter(
+    index: usize,
+    percent: f32,
+    width: usize,
+    palette: Palette,
+) -> Vec<Span<'static>> {
     let percent = percent.clamp(0.0, 100.0);
     let label = format!("CPU {index:>2} ");
     let readout = format!("{percent:.1}%");
@@ -581,22 +759,22 @@ fn logical_cpu_meter(index: usize, percent: f32, width: usize) -> Vec<Span<'stat
     let inner_width = bar_width.saturating_sub(2);
     let tick_width = inner_width.saturating_sub(readout.len() + 1);
     let filled = ((f64::from(percent) / 100.0) * tick_width as f64).round() as usize;
-    let color = usage_color(f64::from(percent) / 100.0);
+    let color = usage_color(f64::from(percent) / 100.0, palette);
 
     vec![
         Span::raw(label),
-        Span::styled("[", Style::default().fg(Color::DarkGray)),
+        Span::styled("[", Style::default().fg(palette.muted)),
         Span::styled(
             BAR_TICK.to_string().repeat(filled.min(tick_width)),
             Style::default().fg(color),
         ),
         Span::styled(
             " ".repeat(tick_width.saturating_sub(filled)),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(palette.muted),
         ),
         Span::raw(" "),
-        Span::styled(readout, Style::default().fg(Color::White)),
-        Span::styled("]", Style::default().fg(Color::DarkGray)),
+        Span::styled(readout, Style::default().fg(palette.foreground)),
+        Span::styled("]", Style::default().fg(palette.muted)),
     ]
 }
 
@@ -631,8 +809,9 @@ fn resource_line(
     readout: &str,
     value_width: usize,
     chart: Vec<Span<'static>>,
+    palette: Palette,
 ) -> Line<'static> {
-    resource_line_with_label_width(label, LABEL_WIDTH, readout, value_width, chart)
+    resource_line_with_label_width(label, LABEL_WIDTH, readout, value_width, chart, palette)
 }
 
 fn resource_line_with_label_width(
@@ -641,12 +820,13 @@ fn resource_line_with_label_width(
     readout: &str,
     value_width: usize,
     chart: Vec<Span<'static>>,
+    palette: Palette,
 ) -> Line<'static> {
     let mut spans = vec![
         Span::raw(format!("{label:<label_width$}")),
         Span::styled(
             format!("{readout:>value_width$}"),
-            Style::default().fg(Color::White),
+            Style::default().fg(palette.foreground),
         ),
     ];
     if !chart.is_empty() {
@@ -656,7 +836,7 @@ fn resource_line_with_label_width(
     Line::from(spans)
 }
 
-fn bar(fraction: f64, width: usize) -> Vec<Span<'static>> {
+fn bar(fraction: f64, width: usize, palette: Palette) -> Vec<Span<'static>> {
     if width < MIN_BAR_CELLS as usize {
         return Vec::new();
     }
@@ -665,26 +845,26 @@ fn bar(fraction: f64, width: usize) -> Vec<Span<'static>> {
     let segment_count = inner_width;
     let filled_segments = (fraction * segment_count as f64).round() as usize;
     let filled_width = filled_segments.min(segment_count);
-    let color = usage_color(fraction);
+    let color = usage_color(fraction, palette);
     vec![
-        Span::styled("[", Style::default().fg(Color::DarkGray)),
+        Span::styled("[", Style::default().fg(palette.muted)),
         Span::styled(
             BAR_TICK.to_string().repeat(filled_width),
             Style::default().fg(color),
         ),
         Span::styled(
             " ".repeat(inner_width - filled_width),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(palette.muted),
         ),
-        Span::styled("]", Style::default().fg(Color::DarkGray)),
+        Span::styled("]", Style::default().fg(palette.muted)),
     ]
 }
 
-fn usage_color(fraction: f64) -> Color {
+fn usage_color(fraction: f64, palette: Palette) -> Color {
     match fraction {
-        fraction if fraction >= 0.9 => Color::Red,
-        fraction if fraction >= 0.75 => Color::Yellow,
-        _ => Color::Green,
+        fraction if fraction >= 0.9 => palette.critical,
+        fraction if fraction >= 0.75 => palette.warning,
+        _ => palette.good,
     }
 }
 
@@ -768,16 +948,16 @@ fn footer_text(app: &App) -> String {
     } else if app.filter().is_empty() {
         if app.view_mode() == ProcessViewMode::Tree {
             format!(
-                "{stale_prefix}{status_prefix}c CPU  g GPU  t Flat  x Kill  s Sort  / Filter  q Quit"
+                "{stale_prefix}{status_prefix}c CPU  g GPU  t Flat  o Theme  x Kill  s Sort  / Filter  q Quit"
             )
         } else {
             format!(
-                "{stale_prefix}{status_prefix}c CPU  g GPU  t Tree  x Kill  s Sort  S Reverse  / Filter  q Quit"
+                "{stale_prefix}{status_prefix}c CPU  g GPU  t Tree  o Theme  x Kill  s Sort  S Reverse  / Filter  q Quit"
             )
         }
     } else {
         format!(
-            "{stale_prefix}{status_prefix}Filter: {}  c CPU  g GPU  t View  x Kill  s Sort  S Reverse  / Edit  q Quit",
+            "{stale_prefix}{status_prefix}Filter: {}  c CPU  g GPU  t View  o Theme  x Kill  s Sort  S Reverse  / Edit  q Quit",
             app.filter()
         )
     }
@@ -933,6 +1113,7 @@ mod tests {
         CommandLine, Freshness, History, HistorySample, Metric, NetworkSnapshot, ProcessSnapshot,
         SystemSnapshot, UserSource,
     };
+    use crate::theme::Theme;
     use ratatui::layout::Rect;
     use ratatui::style::Color;
 
@@ -987,7 +1168,7 @@ mod tests {
         history.push(history_sample(25.0));
         history.push(history_sample(50.0));
         history.push(history_sample(100.0));
-        let lines = cpu_history_lines(Some(&history), 5, 4);
+        let lines = cpu_history_lines(Some(&history), 5, 4, Theme::Default.palette());
         assert_eq!(lines.len(), 5);
         let top_row = lines[0]
             .spans
@@ -1005,7 +1186,8 @@ mod tests {
 
     #[test]
     fn bars_use_semantic_colors_and_do_not_render_when_too_narrow() {
-        let normal = bar(0.5, 6);
+        let palette = Theme::Default.palette();
+        let normal = bar(0.5, 6, palette);
         assert_eq!(
             normal
                 .iter()
@@ -1014,9 +1196,9 @@ mod tests {
             "[||  ]"
         );
         assert_eq!(normal[1].style.fg, Some(Color::Green));
-        assert_eq!(bar(0.8, 6)[1].style.fg, Some(Color::Yellow));
-        assert_eq!(bar(0.95, 6)[1].style.fg, Some(Color::Red));
-        assert!(bar(0.5, 5).is_empty());
+        assert_eq!(bar(0.8, 6, palette)[1].style.fg, Some(Color::Yellow));
+        assert_eq!(bar(0.95, 6, palette)[1].style.fg, Some(Color::Red));
+        assert!(bar(0.5, 5, palette).is_empty());
     }
 
     #[test]
@@ -1035,7 +1217,7 @@ mod tests {
 
     #[test]
     fn logical_cpu_mode_uses_a_responsive_grid_with_numbered_meters() {
-        let lines = logical_cpu_lines(&[0.0, 50.0, 100.0, 25.0], 58);
+        let lines = logical_cpu_lines(&[0.0, 50.0, 100.0, 25.0], 58, Theme::Default.palette());
         assert_eq!(logical_cpu_grid_rows(4, 58), 2);
         assert_eq!(lines.len(), 2);
         let first_line = lines[0]
@@ -1067,7 +1249,8 @@ mod tests {
             gpu: Default::default(),
         };
 
-        for line in cpu_lines(Some(&system), None, 58, CpuDisplayMode::Summary, 8)
+        let palette = Theme::Default.palette();
+        for line in cpu_lines(Some(&system), None, 58, CpuDisplayMode::Summary, 8, palette)
             .into_iter()
             .chain(cpu_lines(
                 Some(&system),
@@ -1075,6 +1258,7 @@ mod tests {
                 58,
                 CpuDisplayMode::LogicalCpus,
                 0,
+                palette,
             ))
         {
             let width = line

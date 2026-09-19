@@ -5,7 +5,10 @@ use std::{
 
 use crossterm::event::{KeyCode, KeyModifiers};
 
-use crate::model::{CommandLine, ProcessSnapshot, Snapshot};
+use crate::{
+    model::{CommandLine, ProcessSnapshot, Snapshot},
+    theme::Theme,
+};
 
 /// Owns the application state that is independent of terminal rendering.
 ///
@@ -24,6 +27,8 @@ pub struct App {
     sort: SortSpec,
     filter: String,
     filter_before_edit: Option<String>,
+    theme: Theme,
+    theme_before_menu: Option<Theme>,
     termination_confirmation: Option<TerminationTarget>,
     termination_request: Option<TerminationTarget>,
     status_message: Option<String>,
@@ -227,6 +232,19 @@ impl App {
         self.filter_before_edit.is_some()
     }
 
+    pub fn theme(&self) -> Theme {
+        self.theme
+    }
+
+    pub fn is_theme_menu_open(&self) -> bool {
+        self.theme_before_menu.is_some()
+    }
+
+    /// The theme currently highlighted in the menu, if it is open.
+    pub fn theme_menu_selection(&self) -> Option<Theme> {
+        self.theme_before_menu.map(|_| self.theme)
+    }
+
     pub fn termination_confirmation(&self) -> Option<&TerminationTarget> {
         self.termination_confirmation.as_ref()
     }
@@ -252,13 +270,39 @@ impl App {
     }
 
     pub fn handle_key_with_modifiers(&mut self, key: KeyCode, modifiers: KeyModifiers) {
+        if self.termination_confirmation.is_some() {
+            self.handle_termination_confirmation(key);
+            return;
+        }
+        if self.is_theme_menu_open() {
+            self.handle_theme_menu_key(key);
+            return;
+        }
         if self.is_filter_editing() {
             self.handle_filter_key(key, modifiers);
             return;
         }
-        if self.termination_confirmation.is_some() {
-            self.handle_termination_confirmation(key);
-            return;
+        if modifiers.contains(KeyModifiers::CONTROL) {
+            match key {
+                KeyCode::Up => {
+                    self.move_selection_by(-(self.page_size() as isize));
+                    return;
+                }
+                KeyCode::Down => {
+                    self.move_selection_by(self.page_size() as isize);
+                    return;
+                }
+                KeyCode::Left => {
+                    self.move_selection_to(0);
+                    return;
+                }
+                KeyCode::Right => {
+                    let last_index = self.visible_processes().len().saturating_sub(1);
+                    self.move_selection_to(last_index);
+                    return;
+                }
+                _ => {}
+            }
         }
 
         match key {
@@ -268,16 +312,28 @@ impl App {
             KeyCode::Char('t') => self.toggle_view_mode(),
             KeyCode::Char('c') => self.toggle_cpu_display_mode(),
             KeyCode::Char('g') => self.cycle_gpu_display(),
+            KeyCode::Char('o') => self.open_theme_menu(),
             KeyCode::Char('x') => self.request_termination(),
             KeyCode::Char('/') => self.begin_filter_edit(),
             KeyCode::Up => self.move_selection_by(-1),
             KeyCode::Down => self.move_selection_by(1),
-            KeyCode::PageUp => self.move_selection_by(-(self.page_size() as isize)),
-            KeyCode::PageDown => self.move_selection_by(self.page_size() as isize),
-            KeyCode::Home => self.move_selection_to(0),
-            KeyCode::End => {
-                let last_index = self.visible_processes().len().saturating_sub(1);
-                self.move_selection_to(last_index);
+            _ => {}
+        }
+    }
+
+    fn open_theme_menu(&mut self) {
+        self.theme_before_menu = Some(self.theme);
+    }
+
+    fn handle_theme_menu_key(&mut self, key: KeyCode) {
+        match key {
+            KeyCode::Up => self.theme = self.theme.previous(),
+            KeyCode::Down => self.theme = self.theme.next(),
+            KeyCode::Enter => self.theme_before_menu = None,
+            KeyCode::Esc => {
+                if let Some(previous_theme) = self.theme_before_menu.take() {
+                    self.theme = previous_theme;
+                }
             }
             _ => {}
         }
@@ -801,6 +857,7 @@ mod tests {
         CommandLine, GpuAdapterSnapshot, Metric, ProcessSnapshot, Snapshot, SystemSnapshot,
         UserSource,
     };
+    use crate::theme::Theme;
     use crossterm::event::{KeyCode, KeyModifiers};
 
     fn process(
@@ -932,6 +989,30 @@ mod tests {
 
         app.handle_key(KeyCode::Char('c'));
         assert_eq!(app.cpu_display_mode(), CpuDisplayMode::LogicalCpus);
+    }
+
+    #[test]
+    fn theme_menu_previews_the_selection_and_can_apply_or_cancel_it() {
+        let mut app = App::new();
+        assert_eq!(app.theme(), Theme::Default);
+
+        app.handle_key(KeyCode::Char('o'));
+        assert!(app.is_theme_menu_open());
+        assert_eq!(app.theme_menu_selection(), Some(Theme::Default));
+
+        app.handle_key(KeyCode::Down);
+        assert_eq!(app.theme(), Theme::Monochromatic);
+        assert_eq!(app.theme_menu_selection(), Some(Theme::Monochromatic));
+
+        app.handle_key(KeyCode::Esc);
+        assert!(!app.is_theme_menu_open());
+        assert_eq!(app.theme(), Theme::Default);
+
+        app.handle_key(KeyCode::Char('o'));
+        app.handle_key(KeyCode::Down);
+        app.handle_key(KeyCode::Enter);
+        assert!(!app.is_theme_menu_open());
+        assert_eq!(app.theme(), Theme::Monochromatic);
     }
 
     #[test]
@@ -1078,7 +1159,7 @@ mod tests {
     }
 
     #[test]
-    fn page_home_and_end_navigation_clamp_to_the_process_list() {
+    fn control_arrow_navigation_clamps_to_the_process_list() {
         let mut app = App::new();
         app.set_viewport_rows(3);
         app.set_snapshot(snapshot(
@@ -1087,19 +1168,19 @@ mod tests {
                 .collect(),
         ));
 
-        app.handle_key(KeyCode::End);
+        app.handle_key_with_modifiers(KeyCode::Right, KeyModifiers::CONTROL);
         assert_eq!(app.selected_pid(), Some(8));
         assert_eq!(app.vertical_offset(), 5);
 
-        app.handle_key(KeyCode::PageUp);
+        app.handle_key_with_modifiers(KeyCode::Up, KeyModifiers::CONTROL);
         assert_eq!(app.selected_pid(), Some(5));
         assert_eq!(app.vertical_offset(), 4);
 
-        app.handle_key(KeyCode::Home);
+        app.handle_key_with_modifiers(KeyCode::Left, KeyModifiers::CONTROL);
         assert_eq!(app.selected_pid(), Some(1));
         assert_eq!(app.vertical_offset(), 0);
 
-        app.handle_key(KeyCode::PageDown);
+        app.handle_key_with_modifiers(KeyCode::Down, KeyModifiers::CONTROL);
         assert_eq!(app.selected_pid(), Some(4));
         assert_eq!(app.vertical_offset(), 1);
 
@@ -1114,15 +1195,15 @@ mod tests {
         app.set_viewport_rows(3);
         app.set_snapshot(snapshot(Vec::new()));
 
-        for key in [
-            KeyCode::Up,
-            KeyCode::Down,
-            KeyCode::PageUp,
-            KeyCode::PageDown,
-            KeyCode::Home,
-            KeyCode::End,
+        for (key, modifiers) in [
+            (KeyCode::Up, KeyModifiers::NONE),
+            (KeyCode::Down, KeyModifiers::NONE),
+            (KeyCode::Up, KeyModifiers::CONTROL),
+            (KeyCode::Down, KeyModifiers::CONTROL),
+            (KeyCode::Left, KeyModifiers::CONTROL),
+            (KeyCode::Right, KeyModifiers::CONTROL),
         ] {
-            app.handle_key(key);
+            app.handle_key_with_modifiers(key, modifiers);
         }
 
         assert_eq!(app.selected_pid(), None);
@@ -1139,7 +1220,7 @@ mod tests {
                 .map(|pid| process(pid, "worker.exe", CommandLine::NotRequested, 0.0))
                 .collect(),
         ));
-        app.handle_key(KeyCode::End);
+        app.handle_key_with_modifiers(KeyCode::Right, KeyModifiers::CONTROL);
 
         app.set_viewport_rows(2);
 

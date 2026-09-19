@@ -1,107 +1,80 @@
 # wtop
 
-`wtop` is an htop-style system monitor for Windows terminals. It
-shows live CPU, memory, Windows commit, network, and process information in a
-full-screen terminal UI.
+> An htop-inspired system monitor for Windows terminals.
 
-## Current features
+`wtop` provides a fast, full-screen view of running processes and system
+resource usage from PowerShell or Windows Terminal. Navigate the process list,
+inspect parent/child relationships, filter and sort live data, and manage a
+selected process without leaving the command line.
 
-- A refreshable process table with PID, user, thread count, CPU usage, memory
-  use, and a flexible name column that keeps process trees readable.
-- A responsive resource dashboard: CPU history or logical-CPU meters, memory
-  and Windows commit bars, plus network transmit/receive rates for active
-  interfaces. The network pane uses Windows interface byte counters and waits
-  for a second sample rather than reporting a misleading initial rate.
-- GPU overview and adapter panes sourced from DXGI and Windows performance
-  counters. The overview lists adapters separately; `g` cycles to a detailed
-  adapter view. Unsupported driver counters remain unavailable rather than
-  appearing as zeroes.
-- A responsive grid of current logical-CPU meters by default; press `c` to
-  switch to the total-CPU history view.
-- Selection and vertical process-list scrolling.
-- Flat and parent/child tree process views, with expandable process groups.
-- Process sorting and live case-insensitive filtering; tree filters retain the
-  ancestors of matching processes for context.
-- Safe resize behavior, a 64 columns by 26 rows minimum-size message, and
-  terminal restoration on exit.
+## Highlights
 
-## Requirements
+- Live CPU, memory, Windows commit, network, GPU, and process monitoring.
+- Sortable and filterable process table with PID, user, thread count, CPU, and
+  memory usage.
+- Flat and collapsible tree views for process hierarchies.
+- Logical CPU meters and aggregate CPU history views.
+- Per-adapter GPU overview and detail panes when Windows exposes the counters.
+- Eleven built-in color themes, with live preview from the terminal UI.
+- Careful terminal cleanup, resize handling, and guarded process termination.
+
+## Quick start
+
+### Prerequisites
 
 - Windows with PowerShell or Windows Terminal.
-- The current stable Rust toolchain, installed through
-  [rustup](https://rustup.rs/).
+- The current stable Rust toolchain from [rustup](https://rustup.rs/).
 
-## Run during development
+### Run from a checkout
 
 ```powershell
 cargo run
 ```
 
-## Install the `wtop` command locally
+### Install locally
 
 ```powershell
 cargo install --path .
-```
-
-Ensure Cargo's bin directory is on your `PATH`, then run:
-
-```powershell
 wtop
 ```
 
-## Keybindings
+Ensure Cargo's bin directory is available on your `PATH` before running the
+installed command.
+
+## Controls
 
 | Key | Action |
 | --- | --- |
 | `Up` / `Down` | Move the selected process |
-| `Page Up` / `Page Down` | Move by one visible page |
-| `Home` / `End` | Select the first / last visible process |
-| `c` | Toggle total CPU history and logical-CPU meters |
-| `g` | Cycle GPU overview and individual GPU panes |
+| `Ctrl+Up` / `Ctrl+Down` | Move by one visible page |
+| `Ctrl+Left` / `Ctrl+Right` | Select the first / last visible process |
+| `c` | Switch between logical CPU meters and total CPU history |
+| `g` | Cycle GPU overview and individual adapter panes |
 | `t` | Toggle flat and tree process views |
-| `x` | Request termination of the selected process; confirm with `y`, cancel with `n` or `Esc` |
-| `s` | Cycle PID, name, user, threads, CPU, and memory sorting |
-| `S` | Reverse the active sort direction |
-| `/` | Edit a filter; it applies as you type |
-| `Enter` | Keep the edited filter |
-| `Esc` | Cancel filter editing, or quit when not editing |
-| `Ctrl+U` | Clear the filter while editing |
+| `o` | Open Themes; use `Up`/`Down` to preview, `Enter` to apply, or `Esc` to cancel |
+| `s` / `S` | Cycle the sort column / reverse its direction |
+| `/` | Edit a live filter (`Ctrl+U` clears it) |
+| `x` | Request termination of the selected process; confirm with `y` |
 | `q` or `Ctrl+C` | Quit |
 
-Filtering matches process names, users, and command lines that Windows allowed
-wtop to read. The table title shows the active sort and current filter.
+The Themes menu includes Default, Monochromatic, Black on White, Light
+Terminal, MC, Black Night, Broken Gray, Nord, Ocean, Evergreen, and Dusk.
+Theme selection applies to the current session.
 
-Process CPU is normalized to total machine capacity, so it ranges from 0 to
-100%, matching the CPU value in the system header.
+## Notes
 
-## Terminology and access limitations
+`Mem` is physical memory used versus total memory. `Commit` is Windows commit
+charge versus its limit, rather than a Linux-style swap measurement.
 
-`Mem` is physical memory used/total. `Commit` is the Windows commit charge and
-commit limit reported by `GetPerformanceInfo`; it is not a Linux-style swap
-measurement.
+Windows protects some system and elevated processes. Command lines, owner
+information, GPU counters, and termination permissions are therefore
+best-effort; unavailable values are shown as unavailable rather than zero.
+`wtop` always asks for confirmation before requesting termination and refuses
+to target PID 0, PID 4, or itself.
 
-Windows restricts access to some protected and system processes. Command-line
-details remain available to filtering when Windows allows wtop to read them,
-but are not shown in the table. Running from an elevated terminal can reveal
-more details, but does not guarantee access to protected processes.
+## Development
 
-`User` is best-effort: the PID 4 System process is shown as `<kernel>` because
-it has no user token. wtop labels the common service SIDs as `SYSTEM`, `LOCAL
-SERVICE`, or `NETWORK SERVICE`; other unresolved identities remain as their
-SID. When a process token cannot be read, wtop consults the Service Control
-Manager for the service's configured account. `<restricted>` means neither
-source was available, and `<unknown>` means Windows supplied no owner at all.
-`Threads` is the current count from the Windows Tool Help process snapshot. If
-that snapshot cannot be read, wtop keeps the prior count and marks it stale.
-
-wtop can request termination of a selected process only after a `y` confirmation.
-It refuses PID 0, PID 4, and itself; Windows access controls decide whether other
-processes can be terminated. Priority changes, saved views, custom columns,
-disk metrics, temperature/clocks/fans, and per-process GPU attribution remain
-outside this milestone. GPU engine and adapter-memory counters are
-driver-dependent; unavailable values are never presented as zeroes.
-
-## Validate a build
+Run the standard checks before contributing:
 
 ```powershell
 cargo fmt --check
@@ -111,22 +84,3 @@ cargo build --release
 ```
 
 The release executable is written to `target\release\wtop.exe`.
-
-## Manual verification checklist
-
-Before publishing a build, test it in both a normal and (optionally) elevated
-PowerShell or Windows Terminal session:
-
-- Confirm values and the process list refresh without blocking navigation, and
-  that the CPU sparkline advances and the memory/commit bars move with the
-  readouts.
-- Move through a process list taller than the terminal and verify that deeply
-  nested tree names remain readable.
-- Toggle tree mode with `t`, then sort with `s`/`S` and filter with `/`; accept,
-  cancel, and clear a filter.
-- Select a disposable test process, press `x`, cancel with `n`, then repeat and
-  confirm with `y`; ensure protected processes report an access error.
-- Resize the terminal, including to 64 columns by 26 rows, then quit with
-  `q`, `Esc`, and `Ctrl+C` to confirm terminal restoration.
-- Confirm protected processes remain visible even when command-line details are
-  unavailable.
